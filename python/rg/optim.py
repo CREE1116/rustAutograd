@@ -1,4 +1,4 @@
-"""Optimizers as pure functions, an ordinary library on top of the core.
+"""Optimizers as pure functions: you can write these yourself; these are here if you would rather not.
 
 `opt.init(params)` builds the state; `opt.update(grads, state, params)` returns
 `(new_params, new_state)`. Both trace like any other function, so the whole update compiles.
@@ -8,7 +8,7 @@ import math
 from typing import Callable, NamedTuple
 
 from . import tree
-from ._core import _flatten, cos, full, maximum, minimum, where, zeros_like
+from ._core import cos, full, maximum, minimum, where, zeros_like
 
 
 class Optimizer(NamedTuple):
@@ -44,7 +44,7 @@ def clip_by_global_norm(grads, max_norm):
 
 
 def _dtype(params):
-    return _flatten(params)[0][0].dtype
+    return tree.leaves(params)[0].dtype
 
 
 def _clip(grads, max_grad_norm):

@@ -84,6 +84,8 @@ int32에서 되는 연산은 `+ - *`, 비교, `where`, 형태 연산, `take`, `c
 
 ## rg.nn
 
+아래는 선택 라이브러리입니다. 공개 API로만 작성되어 있으므로 직접 작성해도 같습니다.
+
 | 분류 | 이름 |
 | --- | --- |
 | 활성화 | `relu`, `gelu`, `sigmoid`, `silu`, `softplus`, `softmax`, `log_softmax`, `logsumexp` |

@@ -1,23 +1,16 @@
-# 다른 프레임워크와 비교
+# 범위와 비교
 
-PyTorch 2.15, JAX, Keras, TensorFlow 2.21의 공개 API 문서와 대조한 결과입니다(2026-11-09 확인). 기능 수를 겨루려는 것이 아니라, 무엇이 없는지 정확히 알리려는 표입니다.
+`rg`는 수학 코드를 기반으로 동작하는 단순한 프레임워크입니다. 기능 수로 다른 프레임워크와 겨루지 않습니다. 기준은 하나입니다.
 
-## 있는 것
+> **사용자가 스스로 만들 수 없는 것만 엔진이 제공합니다. 나머지는 직접 쓰면 되고, 귀찮으면 꺼내 씁니다.**
 
-| 영역 | rg | 대응 |
+| 층 | 내용 | 없으면 |
 | --- | --- | --- |
-| 역방향 미분, 고차 미분 | `grad`, `value_and_grad` | `torch.autograd`, `jax.grad`, `tf.GradientTape` |
-| 순방향 곱, 헤시안 | `jvp`, `hessian` | `jax.jvp`, `jax.hessian` |
-| 사용자 정의 gradient | `custom_vjp` | `jax.custom_vjp`, `tf.custom_gradient` |
-| 정적 컴파일 | `compile` | `jax.jit`, `tf.function`, `torch.compile` |
-| Apple GPU | `device="metal"` | MLX, `torch` MPS |
-| 트리 유틸 | `rg.tree` | `jax.tree` |
-| 명시적 난수 | `rg.random` | `jax.random` |
-| 트랜스포머 구성요소 | `rg.nn` | `torch.nn`, `keras.layers` |
-| 옵티마이저, 스케줄, 클리핑 | `rg.optim` | `torch.optim`, optax, `keras.optimizers` |
-| 체크포인트 | safetensors | `torch.save`, `model.save` |
-| 콜백, 데이터 iterator | `run(callback=, data=)` | `keras` callbacks, `tf.data` |
-| 프로파일러 | `compiled.profile` | `torch.profiler`, `tf.profiler` |
+| 엔진 | 텐서, 미분, 컴파일, 검증, 진단, 디바이스 | 대체할 수 없음 |
+| 선택 라이브러리 | `rg.nn`, `rg.optim` | 몇 줄로 직접 작성 ([예제](quickstart.md#직접-만들기)) |
+| 프레임워크 밖 | 사전학습 모델, 토크나이저, 데이터셋, 학습 루프 도구 | 사용자 코드나 별도 패키지 |
+
+`rg.nn`과 `rg.optim`은 공개 API만 사용하며, 테스트가 이를 강제합니다. 그 안에 없는 레이어가 있다고 해서 부족한 것이 아닙니다.
 
 ## rg에만 있는 것
 
@@ -27,24 +20,19 @@ PyTorch 2.15, JAX, Keras, TensorFlow 2.21의 공개 API 문서와 대조한 결�
 
 PyTorch의 `detect_anomaly`, JAX의 `debug_nans`도 NaN을 찾아 주지만, 위와 같은 구조화된 원인 분류와 확신도를 주지는 않습니다.
 
-## 없는 것
+## 엔진에 없어서 사용자가 만들 수 없는 것
 
-중요도 순서입니다.
+여기 있는 것만 진짜 공백입니다. 중요도 순서입니다.
 
 | 기능 | 영향 | 현재 대안 |
 | --- | --- | --- |
+| **그래프 내 제어 흐름** (`scan`, `while_loop`) | 값에 따라 길이가 달라지는 루프를 표현할 수 없음 | 고정 횟수는 Python 루프로 펼치기, 분기는 `rg.where` |
+| **sort, top-k** | 정렬에 의존하는 수학을 효율적으로 표현할 수 없음 | numpy로 후처리 |
 | **CUDA** | NVIDIA 환경에서 CPU로만 동작 | Apple GPU는 `device="metal"` |
-| **`vmap`** | 샘플별 gradient 등 | 직접 배치 차원으로 작성 |
-| **그래프 내 제어 흐름** (`while_loop`, `scan`, `cond`) | 가변 길이 루프 불가 | Python 루프로 펼치기, `rg.where` |
-| **합성곱·풀링, BatchNorm** | 비전 모델 불가 | 없음 |
-| **sort, top-k** | top-k 샘플링 | 샘플링 후처리를 numpy로 |
-| **einsum, 선형대수**(`solve`, `svd` 등) | 일부 수학 코드 | `@`와 형태 연산 조합 |
 | **동적 shape** | 입력 크기마다 재컴파일 | 고정 길이로 패딩 |
-| **혼합 정밀도, float16** | 메모리·GPU 속도 | f32/f64만 |
-| **분산 학습** | 대규모 학습 | 없음 |
-| **사전학습 모델, 토크나이저** | 모델 재사용 | safetensors 로더로 직접 매핑 가능 |
-| **gradient checkpointing** | 메모리 절약 | 없음 |
-| **텐서 슬라이스 step, 대입** | 일부 코드 | `take`, `concatenate` |
-| **즉시 실행 최적화** | 즉시 연산이 느림 | 반복은 컴파일 |
+| **슬라이스 step, 대입** | 일부 코드가 길어짐 | `take`, `concatenate` |
+| **float16, gradient checkpointing, 분산 실행** | 큰 규모의 학습 | 없음 |
 
-생태계도 큰 차이입니다. 위 프레임워크들은 수년간의 커뮤니티, 사전학습 모델, 배포 도구를 갖고 있으며 `rg`에는 없습니다.
+## 사용자가 만들 수 있어 일부러 두지 않은 것
+
+합성곱·풀링 레이어, BatchNorm, einsum 표기, 데이터 증강, 학습 루프, 지표 모음, 사전학습 가중치 로더 등입니다. 대부분 지금의 연산으로 작성할 수 있습니다. 다만 합성곱을 `take`와 `@`로 쓰면 전용 커널보다 느립니다. 실제 사용에서 병목으로 측정되면 그때 프리미티브를 검토합니다.

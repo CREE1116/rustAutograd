@@ -2,7 +2,7 @@
 
 > Define Mathematics. Compile with Confidence. Run at Speed.
 
-Python으로 수학 함수를 정의하면 Rust 엔진이 추적·미분·최적화·검증한 뒤, 스텝 사이에 Python으로 돌아오지 않고 반복 실행합니다. 문자 단위 GPT를 학습하고 샘플링할 수 있습니다.
+Python으로 수학 함수를 정의하면 Rust 엔진이 추적·미분·최적화·검증한 뒤, 스텝 사이에 Python으로 돌아오지 않고 반복 실행합니다. 레이어와 옵티마이저는 직접 쓰면 되고, 귀찮으면 `rg.nn`과 `rg.optim`을 꺼내 쓰면 됩니다.
 
 **문서:** [`docs/`](docs/index.md) (`.venv/bin/mkdocs serve`로 사이트 보기)
 
@@ -14,7 +14,7 @@ Python으로 수학 함수를 정의하면 Rust 엔진이 추적·미분·최적
 | [진단 시스템](docs/diagnostics.md) | 오류 형식과 코드 목록 |
 | [API 레퍼런스](docs/api.md) | 공개 API 전체 |
 | [성능](docs/performance.md) | PyTorch·JAX 대조 측정 |
-| [비교와 공백](docs/comparison.md) | 없는 기능 목록 |
+| [범위와 비교](docs/comparison.md) | 엔진에 두는 것과 두지 않는 것 |
 
 **백엔드:** CPU와 Metal(Apple GPU)을 지원합니다. CUDA는 아직 없습니다.
 

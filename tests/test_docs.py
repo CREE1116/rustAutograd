@@ -45,3 +45,16 @@ def test_every_diagnostic_code_is_documented():
     page = open(os.path.join(ROOT, "docs", "diagnostics.md"), encoding="utf-8").read()
     missing = [c for c in sorted(codes) if f"`{c}`" not in page]
     assert not missing, f"undocumented codes: {missing}"
+
+
+def test_libraries_have_no_engine_privileges():
+    """`nn` and `optim` must be writable by a user: only public names, no native handles."""
+    import ast
+    for module in ("nn", "optim"):
+        tree = ast.parse(open(os.path.join(ROOT, "python", "rg", f"{module}.py"), encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in ("_core", "_rg"):
+                private = [a.name for a in node.names if a.name.startswith("_") or not hasattr(rg, a.name)]
+                assert not private, f"{module} imports non-public {private}"
+            if isinstance(node, ast.Attribute):
+                assert not node.attr.startswith("_"), f"{module} reaches into {node.attr}"

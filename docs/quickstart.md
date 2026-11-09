@@ -88,12 +88,49 @@ except rg.DiagnosticError as e:
     assert e.diagnostic["observation"]["recompile_required"] is True
 ```
 
-## 신경망과 옵티마이저
+## 직접 만들기
 
-`rg.nn`의 레이어는 상태 없는 객체입니다. `init(key)`가 파라미터 트리를 돌려주고, 호출할 때 파라미터를 넘깁니다.
+레이어와 옵티마이저는 그냥 수학입니다. 프레임워크가 제공하지 않아도 몇 줄이면 됩니다. Adam을 직접 쓰면 이렇습니다.
 
 ```python
-from rg import nn, optim, random
+def my_adam_step(w, m, n, t, g, lr=0.01, b1=0.9, b2=0.999, eps=1e-8):
+    m = b1 * m + (1.0 - b1) * g
+    n = b2 * n + (1.0 - b2) * (g * g)
+    t = t + 1.0
+    return w - lr * (m / (1.0 - b1 ** t)) / ((n / (1.0 - b2 ** t)).sqrt() + eps), m, n, t
+
+def by_hand(s, batch):
+    v, g = rg.value_and_grad(loss)(s["w"], batch)
+    w, m, n, t = my_adam_step(s["w"], s["m"], s["n"], s["t"], g)
+    return {"w": w, "m": m, "n": n, "t": t}, v
+
+start = {"w": rg.zeros(4), "m": rg.zeros(4), "n": rg.zeros(4), "t": rg.tensor(0.0)}
+mine = rg.run(rg.compile(by_hand, (start, (x, y))), start, (x, y), steps=100)
+```
+
+컴파일, 검증, 진단은 직접 쓴 코드에도 똑같이 적용됩니다. 결과는 아래의 `rg.optim.adam`과 같습니다.
+
+```python
+from rg import optim
+
+opt = optim.adam(0.01)
+s0 = {"w": rg.zeros(4), "o": opt.init(rg.zeros(4))}
+
+def with_library(s, batch):
+    v, g = rg.value_and_grad(loss)(s["w"], batch)
+    w, o = opt.update(g, s["o"], s["w"])
+    return {"w": w, "o": o}, v
+
+theirs = rg.run(rg.compile(with_library, (s0, (x, y))), s0, (x, y), steps=100)
+np.testing.assert_allclose(mine.state["w"].numpy(), theirs.state["w"].numpy(), rtol=1e-5)
+```
+
+## 귀찮으면 꺼내 쓰기
+
+`rg.nn`과 `rg.optim`은 위와 같은 코드를 모아 둔 선택 라이브러리입니다. 엔진 권한 없이 공개 API만 씁니다. `rg.nn`의 레이어는 상태 없는 객체입니다. `init(key)`가 파라미터 트리를 돌려주고, 호출할 때 파라미터를 넘깁니다.
+
+```python
+from rg import nn, random
 
 model = nn.Sequential(nn.Linear(4, 16), nn.relu, nn.Linear(16, 1))
 params = model.init(random.key(0))

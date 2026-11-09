@@ -1,6 +1,6 @@
-"""Neural-network building blocks: an ordinary library on top of the core.
+"""Neural-network building blocks: you can write these yourself; these are here if you would rather not.
 
-Nothing here has engine privileges. Layers are small stateless objects: `layer.init(key)` returns a
+Nothing here has engine privileges: it uses only the public API, which a test enforces. Layers are small stateless objects: `layer.init(key)` returns a
 parameter tree and `layer(params, x, ...)` applies it, so parameters stay explicit values that
 differentiate, compile and checkpoint like any other tree.
 """
