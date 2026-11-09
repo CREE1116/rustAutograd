@@ -841,7 +841,8 @@ fn arg_top_k<T: Elem>(i: &Instr, s: &mut [Buf], k: usize) {
         match q.partial_cmp(&p) {
             Some(std::cmp::Ordering::Equal) => x.cmp(&y),
             Some(order) => order,
-            None => (p != p).cmp(&(q != q)).then(x.cmp(&y)),
+            // Only NaN is unordered with itself.
+            None => p.partial_cmp(&p).is_none().cmp(&q.partial_cmp(&q).is_none()).then(x.cmp(&y)),
         }
     };
     let select = |(out, row): (&mut [i32], &[T])| {

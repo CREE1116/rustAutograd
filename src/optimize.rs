@@ -213,7 +213,7 @@ pub fn optimize_mode(g: &Graph, outputs: &[u32], metal: bool, mode: Mode) -> (Gr
         let keep = g.reachable(outputs).iter().filter(|&&k| k).count();
         return (g.clone(), outputs.to_vec(), OptStats { nodes_before: keep, nodes_after: keep, ..Default::default() });
     }
-    let (ng, out, mut st, backward) = match mode {
+    let (ng, out, st, backward) = match mode {
         Mode::Search | Mode::SearchExact | Mode::SearchLinear => {
             let baseline = simplify(g, outputs, metal, true);
             let (first, first_out, _, _) = simplify(g, outputs, false, false);

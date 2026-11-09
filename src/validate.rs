@@ -423,22 +423,31 @@ fn push_diagnostic(report: &mut Value, d: Diag) {
     }
 }
 
-/// Runs of each candidate, keeping the fastest time. A long-running step spends the budget at once.
-const AUTO_TIMING_RUNS: usize = 5;
+/// Rounds of timing, and how long they may take. A long-running step ends the rounds early.
+const AUTO_ROUNDS: usize = 7;
+const AUTO_BUDGET_SECONDS: f64 = 0.5;
 const AUTO_MIN_SPEEDUP: f64 = 1.05;
 
-fn timed(c: &Compiled, examples: &[Tensor]) -> f64 {
-    let mut best = f64::INFINITY;
+/// Median seconds per run of each candidate, interleaved so neither gets the warmed-up machine.
+fn timed_pair(a: &Compiled, b: &Compiled, examples: &[Tensor]) -> (f64, f64) {
+    let (mut ta, mut tb) = (vec![], vec![]);
     let started = std::time::Instant::now();
-    for _ in 0..AUTO_TIMING_RUNS {
-        let t0 = std::time::Instant::now();
-        let _ = c.try_call(examples);
-        best = best.min(t0.elapsed().as_secs_f64());
-        if started.elapsed().as_secs_f64() > 0.25 {
+    for round in 0..AUTO_ROUNDS {
+        for k in [round % 2, 1 - round % 2] {
+            let (c, times) = if k == 0 { (a, &mut ta) } else { (b, &mut tb) };
+            let t0 = std::time::Instant::now();
+            let _ = c.try_call(examples);
+            times.push(t0.elapsed().as_secs_f64());
+        }
+        if started.elapsed().as_secs_f64() > AUTO_BUDGET_SECONDS {
             break;
         }
     }
-    best
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    (median(&mut ta), median(&mut tb))
 }
 
 /// Lets the hardware decide between the plain plan and the rewritten one.
@@ -451,7 +460,7 @@ fn compile_auto(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Level
     if rewritten {
         // The first call of each pays for allocation; only the later runs count.
         let _ = (standard.try_call(examples), searched.try_call(examples));
-        let (a, b) = (timed(&standard, examples), timed(&searched, examples));
+        let (a, b) = timed_pair(&standard, &searched, examples);
         use_search = a / b >= AUTO_MIN_SPEEDUP;
         timing = json!({ "standard_seconds": a, "rewritten_seconds": b });
     }
