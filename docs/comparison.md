@@ -12,6 +12,10 @@
 
 `rg.nn`과 `rg.optim`은 공개 API만 사용하며, 테스트가 이를 강제합니다. 그 안에 없는 레이어가 있다고 해서 부족한 것이 아닙니다.
 
+## 연구용 관찰
+
+`rg.observe`가 파라미터별 gradient 기록, 손실 지형, 학습 경로, 단일 HTML 리포트를 제공합니다. [학습 관찰과 손실 지형](observe.md)을 보세요.
+
 ## rg에만 있는 것
 
 - 컴파일에 포함된 시험 실행, 노드별 유한성 검사, 최적화 전후 동치 검사, 유한차분 검사
@@ -28,7 +32,7 @@ PyTorch의 `detect_anomaly`, JAX의 `debug_nans`도 NaN을 찾아 주지만, 위
 | --- | --- | --- |
 | **CUDA** | NVIDIA 환경에서 CPU로만 동작 | Apple GPU는 `device="metal"` |
 | **동적 shape** | 입력 크기마다 재컴파일 | 고정 길이로 패딩 |
-| **슬라이스 step, 대입** | 일부 코드가 길어짐 | `take`, `concatenate` |
+| **제자리 대입** (`x[i] = v`) | 함수형 설계상 없음 | `where`, `concatenate` |
 | **float16, gradient checkpointing, 분산 실행** | 큰 규모의 학습 | 없음 |
 
 ## 사용자가 만들 수 있어 일부러 두지 않은 것

@@ -524,12 +524,14 @@ impl Compiled {
             }
             return Ok(self.plan.outputs.iter().map(|o| Tensor { shape: o.shape.clone(), data: e.prefix(o.slot, o.n) }).collect());
         }
-        let mut f = self.plan.frame();
+        let mut f = self.frames.lock().expect("no panic while pooling").pop().unwrap_or_else(|| self.plan.frame());
         for (k, t) in inputs.iter().enumerate() {
             self.plan.load_input(&mut f, k, t);
         }
         self.plan.exec(&mut f, &mut ());
-        Ok((0..self.outputs.len()).map(|k| self.plan.read_output(&f, k)).collect())
+        let values = (0..self.outputs.len()).map(|k| self.plan.read_output(&f, k)).collect();
+        self.frames.lock().expect("no panic while pooling").push(f);
+        Ok(values)
     }
 
     pub fn call(&self, inputs: &[Tensor]) -> Vec<Tensor> {

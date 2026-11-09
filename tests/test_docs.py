@@ -27,6 +27,7 @@ def test_every_public_name_is_documented():
         ("nn", [n for n in dir(rg.nn) if not n.startswith("_") and getattr(getattr(rg.nn, n), "__module__", "") == "rg.nn"]),
         ("optim", [n for n in dir(rg.optim) if not n.startswith("_") and getattr(getattr(rg.optim, n), "__module__", "") == "rg.optim" and n != "Optimizer"]),
         ("random", [n for n in dir(rg.random) if not n.startswith("_") and getattr(getattr(rg.random, n), "__module__", "") == "rg.random"]),
+        ("observe", [n for n in dir(rg.observe) if not n.startswith("_") and getattr(getattr(rg.observe, n), "__module__", "") == "rg.observe"]),
         ("tree", [n for n in dir(rg.tree) if not n.startswith("_") and getattr(getattr(rg.tree, n), "__module__", "") == "rg.tree"]),
     ]:
         missing = [n for n in names if f"`{n}" not in api]
@@ -50,7 +51,7 @@ def test_every_diagnostic_code_is_documented():
 def test_libraries_have_no_engine_privileges():
     """`nn` and `optim` must be writable by a user: only public names, no native handles."""
     import ast
-    for module in ("nn", "optim"):
+    for module in ("nn", "optim", "observe"):
         tree = ast.parse(open(os.path.join(ROOT, "python", "rg", f"{module}.py"), encoding="utf-8").read())
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module in ("_core", "_rg"):

@@ -104,7 +104,7 @@ assert again["diagnostics"][0]["node"]["id"] == root["node"]["id"]
 | `UNSUPPORTED_DTYPE` | 실수 전용 연산에 int32 사용 | `.cast("float32")` |
 | `UNSUPPORTED_RANK` | 스칼라의 행렬곱 | 차원 추가 |
 | `INVALID_AXIS` | 축이 범위 밖이거나 중복, 빈 축 축약 | 축 인자 수정 |
-| `INVALID_SLICE` | 인덱스 범위 초과, step이 1이 아닌 슬라이스, 지원하지 않는 인덱스 타입 | 슬라이스 수정 |
+| `INVALID_SLICE` | 인덱스 범위 초과, 아무것도 고르지 않는 step 슬라이스, 지원하지 않는 인덱스 타입 | 슬라이스 수정 |
 | `INVALID_KEY` | 난수 키가 int32 `(2,)`가 아님 | `random.key`, `random.split` 사용 |
 | `INVALID_NODE_REF` | 없는 노드 참조 (엔진 사용 오류) | 버그 신고 |
 | `ARITY_MISMATCH` | 연산의 입력 개수가 틀림 (엔진 사용 오류) | 버그 신고 |
@@ -135,6 +135,15 @@ assert again["diagnostics"][0]["node"]["id"] == root["node"]["id"]
 | `PLAN_NEAR_PHYSICAL_MEMORY` | 중간 버퍼 계획이 물리 메모리의 절반 초과 (경고, `suspected`). 스왑으로 몇 배 느려질 수 있음. Windows에서는 메모리를 조회하지 않아 보고되지 않음 | 배치나 모델 축소, `report["memory"]` 확인 |
 | `REPLAY_DID_NOT_REPRODUCE` | 재생에서 실패가 재현되지 않음 (`unknown`) | 입력의 결정성 확인 |
 | `NONFINITE_NOT_LOCALIZED` | 빠른 계획은 실패했으나 기준 실행은 유한 (`unknown`) | 오버플로 경계의 반올림 차이일 수 있음 |
+
+`observe.findings`는 계측된 실행에서 다음 패턴을 찾습니다. 학습 중단을 제외하면 모두 `suspected`입니다.
+
+| 코드 | 언제 | 대응 |
+| --- | --- | --- |
+| `RUN_STOPPED_NONFINITE` | 실행이 NaN이나 Inf로 멈춤 (`verified`) | `rg.inspect(result)`로 원인 노드 확인 |
+| `GRADIENT_COLLAPSED_WHILE_LOSS_STALLED` | 손실이 크게 줄지 않았는데 gradient가 정점의 1000분의 1 아래로 떨어짐 | 경로와 초기화 확인 |
+| `MOSTLY_ZERO_GRADIENT` | 파라미터 gradient의 절반 이상이 정확히 0 | 쓰이지 않는 원소나 죽은 유닛 확인 |
+| `LARGE_RELATIVE_UPDATES` | 업데이트가 파라미터 크기의 10%를 넘음 | 학습률 확인 |
 
 ## 프로파일링
 

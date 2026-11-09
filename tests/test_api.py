@@ -311,7 +311,6 @@ def test_tensor_conversions_and_bad_data():
     assert e.value.diagnostic["diagnosis"]["cause"] == "ragged_nested_sequence"
     with pytest.raises(rg.DiagnosticError):
         t[5]
-    with pytest.raises(rg.DiagnosticError):
-        t[::2]
+    assert t[::2].shape == (1, 3)
     with pytest.raises(ValueError):
         rg._rg.Tensor(b"abc", [1], "float32")

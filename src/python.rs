@@ -185,6 +185,10 @@ impl PyGraph {
         self.g.cur_source = source.map(Arc::from);
         self.g.add(Op::Custom { placeholder, rules }, &[y]).map_err(|d| raise(py, d))
     }
+    /// (differentiated value, with respect to, gradient) of each `grad` call so far.
+    fn grad_records(&self) -> Vec<(u32, u32, u32)> {
+        self.g.grads.iter().map(|r| (r.y, r.wrt, r.grad)).collect()
+    }
     fn shape(&self, id: u32) -> Vec<usize> {
         self.g.shape(id).to_vec()
     }

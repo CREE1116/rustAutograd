@@ -5,7 +5,7 @@
 | 이름 | 설명 |
 | --- | --- |
 | `tensor(data, dtype=None)` | 숫자, 중첩 리스트, numpy 배열에서 `Tensor` 생성 |
-| `compile(fn, example_inputs, validate="standard", device="cpu", optimize="search-linear")` | 추적, 미분, 최적화, 검증을 거쳐 `Compiled` 반환. [`optimize` 모드](compiler.md#모드) |
+| `compile(fn, example_inputs, validate="standard", device="cpu", optimize="search-linear", observe=False)` | 추적, 미분, 최적화, 검증을 거쳐 `Compiled` 반환. [`optimize` 모드](compiler.md#모드), [`observe`](observe.md) |
 | `devices()` | 쓸 수 있는 디바이스 목록 |
 | `run(compiled, state, data=None, steps=1, callback=None, every=None)` | 네이티브 반복 실행, `RunResult` 반환 |
 | `inspect(target)` | `RunResult`나 `Compiled`의 분석 리포트. 실패 시 재생으로 원인 탐색 |
@@ -33,7 +33,7 @@
 `Tensor`는 실제 값, `Tracer`는 추적 중인 심볼입니다. 둘 다 같은 연산을 지원합니다.
 
 - 연산자: `+ - * / ** @`, 단항 `-`, `abs()`, `> >= < <=`(0/1 반환)
-- 인덱싱: 정수, 슬라이스(step 1), `None`, `...`, int32 텐서
+- 인덱싱: 정수, 슬라이스(음수 step 포함), `None`, `...`, int32 텐서, 정수 리스트
 - 메서드: `sum`, `mean`, `max`, `min`, `var`, `std`, `reshape`, `transpose`, `T`, `swapaxes`, `squeeze`, `take`, `argmax`, `cast`, `astype`, `exp`, `log`, `sqrt`, `sin`, `cos`, `tanh`, `floor`
 - `Tensor` 전용: `numpy()`, `tolist()`, `item()`
 
@@ -73,6 +73,24 @@
 | 선형대수 | `matmul` (N차원 배치와 브로드캐스트 지원) |
 
 int32에서 되는 연산은 `+ - *`, 비교, `where`, 형태 연산, `take`, `cast`입니다.
+
+집계 함수는 메서드와 같습니다: `sum`, `mean`, `max`, `min`, `var`, `std`. 그 밖에 `flip`, `not_equal`이 있습니다.
+
+## rg.observe
+
+선택 기능입니다. [학습 관찰과 손실 지형](observe.md)을 참고하세요.
+
+| 이름 | 설명 |
+| --- | --- |
+| `Recorder(select=None)` | `run` 콜백. 파라미터 스냅샷 저장 |
+| `Landscape` | 손실 단면 결과. `to_dict()`로 JSON 호환 |
+| `loss_landscape(loss, params, *args, directions, span, resolution, seed, device)` | 2D 손실 단면 |
+| `trajectory_landscape(loss, recorder, *args, resolution, margin, device)` | 학습 경로가 움직인 평면의 단면과 경로 |
+| `random_directions(params, key, normalize="layer")` | 층 정규화된 무작위 방향 |
+| `pca_directions(snapshots, center=None)` | 스냅샷의 주성분 방향과 설명 비율 |
+| `findings(result)` | 살펴볼 패턴과 증거 |
+| `data(result, landscape, title)` | 리포트의 데이터를 JSON 호환으로 |
+| `report(path, result, landscape, title)` | 외부 의존 없는 HTML 한 파일 작성 |
 
 ## rg.random
 

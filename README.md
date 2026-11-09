@@ -63,6 +63,8 @@ opt = optim.adamw(1e-3)
 
 **같은 수학의 더 나은 표현을 컴파일러가 찾습니다.** 동치인 수식을 함께 유지하는 e-graph로 행렬곱 순서와 공통 인수를 고릅니다. `A @ B @ C @ D`를 비싼 순서로 써도 CPU에서 약 8배, `x @ (U @ V) @ x`는 약 15배 빨라집니다(M4 Pro, 해당 프로그램 기준). 이미 잘 쓴 코드는 그대로 둡니다. 재작성은 동치 검사를 통과해야 채택합니다. 무엇이 통했고 무엇이 안 통했는지는 [컴파일러 연구 기록](docs/compiler.md)에 있습니다.
 
+**학습을 들여다볼 수 있습니다.** `observe=True`로 컴파일하면 파라미터별 gradient와 업데이트 비율이 스텝마다 기록되고, `rg.observe`가 손실 지형과 학습 경로를 계산해 외부 의존 없는 HTML 리포트로 그려 줍니다. 켜지 않으면 계획에 아무것도 들어가지 않습니다. [학습 관찰과 손실 지형](docs/observe.md)을 보세요.
+
 ## 오류는 문장이 아니라 증거입니다
 
 `where(x > 0, sqrt(x), 0)`은 값은 멀쩡한데 x=0에서 gradient가 NaN이 되는 유명한 함정입니다.
@@ -151,7 +153,7 @@ M4 Pro 한 대, GPT와 MLP 벤치마크뿐이므로 다른 모델이나 NVIDIA �
 
 ## 문서
 
-[설치](docs/install.md) · [빠른 시작](docs/quickstart.md) · [추적과 컴파일](docs/concepts.md) · [진단 시스템](docs/diagnostics.md) · [언어 모델 튜토리얼](docs/tutorial-gpt.md) · [API](docs/api.md) · [컴파일러 연구 기록](docs/compiler.md) · [내부 구조](docs/internals.md)
+[설치](docs/install.md) · [빠른 시작](docs/quickstart.md) · [추적과 컴파일](docs/concepts.md) · [진단 시스템](docs/diagnostics.md) · [학습 관찰](docs/observe.md) · [언어 모델 튜토리얼](docs/tutorial-gpt.md) · [API](docs/api.md) · [컴파일러 연구 기록](docs/compiler.md) · [내부 구조](docs/internals.md)
 
 문서 안의 Python 코드는 테스트에서 모두 실행됩니다. 사이트로 보려면 `mkdocs-material`을 설치하고 `mkdocs serve`를 실행하세요.
 

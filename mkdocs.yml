@@ -30,6 +30,7 @@ nav:
   - 개념:
       - 추적과 컴파일: concepts.md
       - 진단 시스템: diagnostics.md
+      - 학습 관찰과 손실 지형: observe.md
   - 튜토리얼:
       - 언어 모델 만들기: tutorial-gpt.md
   - API 레퍼런스: api.md

@@ -131,8 +131,8 @@ class _Ops:
         return (self[i] for i in range(self.shape[0]))
 
     def __getitem__(self, key):
-        if isinstance(key, (Tensor, Tracer)) or (hasattr(key, "tobytes") and hasattr(key, "dtype")):
-            return take(self, key, 0)
+        if isinstance(key, (Tensor, Tracer, list)) or (hasattr(key, "tobytes") and hasattr(key, "dtype")):
+            return take(self, tensor(key, "int32") if isinstance(key, list) else key, 0)
         key = key if isinstance(key, tuple) else (key,)
         if any(k is Ellipsis for k in key):
             at = next(i for i, k in enumerate(key) if k is Ellipsis)
@@ -140,6 +140,21 @@ class _Ops:
             key = key[:at] + (slice(None),) * (self.ndim - used) + key[at + 1:]
         if sum(1 for k in key if k is not None) > self.ndim:
             raise _fail("INVALID_SLICE", {"shape": self.shape, "index_rank": len(key)}, "too_many_indices")
+        # A step other than 1 is a take of the positions it visits.
+        stepped = self
+        plain = []
+        position = 0
+        for k in key:
+            if isinstance(k, slice) and k.step not in (None, 1):
+                indices = list(range(*k.indices(self.shape[position])))
+                if not indices:
+                    raise _fail("INVALID_SLICE", {"shape": self.shape, "axis": position, "slice": repr(k)}, "stepped_slice_selects_nothing")
+                stepped = take(stepped, tensor(indices, "int32"), position)
+                k = slice(None)
+            plain.append(k)
+            position += 0 if k is None else 1
+        if stepped is not self:
+            return stepped[tuple(plain)]
         starts, stops, keep = [], [], []
         axis = 0
         for k in key + (slice(None),) * (self.ndim - sum(1 for k in key if k is not None)):
@@ -148,9 +163,7 @@ class _Ops:
                 continue
             dim = self.shape[axis]
             if isinstance(k, slice):
-                start, stop, stride = k.indices(dim)
-                if stride != 1:
-                    raise _fail("INVALID_SLICE", {"shape": self.shape, "step": k.step}, "slice_step_not_supported")
+                start, stop, _ = k.indices(dim)
                 starts.append(start)
                 stops.append(max(start, stop))
                 keep.append(max(0, stop - start))
@@ -515,6 +528,12 @@ def sign(x): return _op("sign", x)
 def square(x): return x * x
 def clip(x, low, high): return minimum(maximum(x, low), high)
 def equal(a, b): return _op("ge", a, b) * _op("ge", b, a)
+def not_equal(a, b): return 1 - equal(a, b)
+
+
+def flip(x, axis=-1):
+    axis = _axis(x, axis)
+    return take(x, tensor(list(range(x.shape[axis] - 1, -1, -1)), "int32"), axis)
 def broadcast_to(x, shape): return _op("broadcast_to", x, shape=list(shape))
 def matmul(a, b): return _op("matmul", a, b)
 def reshape(x, *shape): return x.reshape(*shape)
@@ -805,8 +824,10 @@ class Report(dict):
 class Compiled:
     """An executable plan plus the evidence gathered about it."""
 
-    def __init__(self, native, in_def, in_sig, out_def, examples):
+    def __init__(self, native, in_def, in_sig, out_def, examples, n_user, extras):
         self._n = native
+        self._n_user = n_user  # outputs of the function itself; instruments follow them
+        self._extras = extras
         self._in_def = in_def
         self._in_sig = in_sig
         self._out_def = out_def
@@ -825,7 +846,7 @@ class Compiled:
 
     def __call__(self, *args):
         out = self._n.call(self._inputs(args))
-        return _unflatten(self._out_def, [Tensor(t) for t in out])
+        return _unflatten(self._out_def, [Tensor(t) for t in out[:self._n_user]])
 
     def check(self, *args):
         """Runs instrumented on the given inputs and returns diagnostics."""
@@ -841,7 +862,43 @@ def devices():
     return _rg.available_devices()
 
 
-def compile(fn, example_inputs, validate="standard", device="cpu", optimize="search-linear"):
+def _instruments(g, in_def, inputs, out_leaves, out_def):
+    """Scalars describing each differentiated input, as (name, node) pairs. Only for `observe=True`."""
+    names = {t._id: n for t, n in zip(inputs, _paths(in_def, ""))}
+    latest = {}
+    for _, wrt, grad_id in g.grad_records():
+        if wrt in names:
+            latest[wrt] = grad_id
+    extras = []
+    total = 0.0
+    for wrt, grad_id in latest.items():
+        name = names[wrt].lstrip(".").removeprefix("0.")
+        gr = Tracer(g, grad_id)
+        squared = (gr * gr).sum()
+        total = total + squared
+        size = max(1, gr.size)
+        extras.append((f"grad.{name}.norm", squared.sqrt()))
+        extras.append((f"grad.{name}.max", abs(gr).max()))
+        extras.append((f"grad.{name}.zero", (0.0 >= abs(gr)).sum() / size))
+    if latest:
+        extras.append(("grad.global_norm", total.sqrt()))
+    # Relative parameter change, when the outputs follow the `new_state` contract.
+    state_def = in_def[1][0]
+    n_state = len(_flatten(_unflatten(state_def, [0] * sum(1 for _ in _paths(state_def, ""))))[0])
+    returns_state = out_def == state_def or (out_def is not None and out_def[0] == "tuple" and len(out_def[1]) == 2 and out_def[1][0] == state_def)
+    if returns_state:
+        for old, new in zip(inputs[:n_state], out_leaves[:n_state]):
+            if old._id in latest and isinstance(new, Tracer):
+                name = names[old._id].lstrip(".").removeprefix("0.")
+                d = new - old
+                size_now = (old * old).sum().sqrt()
+                # A parameter at exactly zero has no relative change, so that step records 0 and not
+                # a ratio in the billions. Not NaN: `run` stops on a non-finite scalar.
+                extras.append((f"update.{name}", where(size_now > 0.0, (d * d).sum().sqrt() / where(size_now > 0.0, size_now, 1.0), 0.0)))
+    return [(n, _node(g, v, "float32")) for n, v in extras]
+
+
+def compile(fn, example_inputs, validate="standard", device="cpu", optimize="search-linear", observe=False):
     """Traces `fn(*example_inputs)`, differentiates, optimizes and tests it for `device`.
 
     `optimize` chooses how hard to look for a better form of the same math:
@@ -853,6 +910,9 @@ def compile(fn, example_inputs, validate="standard", device="cpu", optimize="sea
     - `"search-exact"`, `"search"`: narrower and wider rule sets.
     - `"auto"`: times the candidates on the example inputs. Can differ between runs.
     - `"none"`: only removes dead code.
+
+    `observe=True` compiles a separate, instrumented program: `run` then records per-parameter
+    gradient and update statistics in `history`. Without it, none of this exists in the plan.
     """
     if not isinstance(example_inputs, tuple):
         example_inputs = (example_inputs,)
@@ -866,10 +926,12 @@ def compile(fn, example_inputs, validate="standard", device="cpu", optimize="sea
         out_leaves, out_def = _flatten(out)
         dtype = _dtype_of(leaves) or "float32"
         out_ids = [_node(g, l, dtype) for l in out_leaves]
+        extras = _instruments(g, in_def, tracers, out_leaves, out_def) if observe else []
     finally:
         _traces.pop()
-    native = _rg.compile(g, out_ids, [t._t for t in leaves], validate, device, optimize)
-    compiled = Compiled(native, in_def, [(t.shape, t.dtype) for t in leaves], out_def, leaves)
+    all_ids = out_ids + [i for _, i in extras]
+    native = _rg.compile(g, all_ids, [t._t for t in leaves], validate, device, optimize)
+    compiled = Compiled(native, in_def, [(t.shape, t.dtype) for t in leaves], out_def, leaves, len(out_ids), [n for n, _ in extras])
     _warn_about_memory(compiled, src)
     return compiled
 
@@ -967,13 +1029,17 @@ def run(compiled, state, data=None, steps=1, callback=None, every=None):
     # Shapes come from the plan's signature, so the first native call needs no probe run.
     probe = compiled._n.output_shapes
     scalar = [k for k in range(n_state, n_state + len(aux_names)) if all(d == 1 for d in probe[k])]
+    names_of = {k: aux_names[k - n_state] for k in scalar}
+    for j, name in enumerate(compiled._extras):
+        names_of[compiled._n_user + j] = name
+        scalar.append(compiled._n_user + j)
     state_map = [(k, k) for k in range(n_state)]
     data_inputs = list(range(n_state, len(compiled._in_sig)))
     chunk = every if every else (256 if iterator is not None else steps)
     chunk = max(1, min(chunk, steps)) if steps else 1
 
     current = [t._t for t in leaves]
-    history = {aux_names[k - n_state]: [] for k in scalar}
+    history = {names_of[k]: [] for k in scalar}
     done, elapsed, bad_step, aux, stopped = 0, 0.0, None, None, False
     last = (current, batches[:1], 0, 0)
     while done < steps and bad_step is None and not stopped:
@@ -994,14 +1060,14 @@ def run(compiled, state, data=None, steps=1, callback=None, every=None):
         new_state, outputs, hist, ran, bad, seconds = compiled._n.run(state_map, data_inputs, scalar, current, part, n)
         last = (current, part, ran, done)
         for k, h in zip(scalar, hist):
-            history[aux_names[k - n_state]].extend(h)
+            history[names_of[k]].extend(h)
         done += ran
         elapsed += seconds
         bad_step = None if bad is None else done - ran + bad
         if bad_step is None and not all(t.is_finite() for t in new_state):
             bad_step = done - 1
         current = new_state
-        aux = _unflatten(aux_def, [Tensor(t) for t in outputs[n_state:]]) if has_aux and outputs else aux
+        aux = _unflatten(aux_def, [Tensor(t) for t in outputs[n_state:compiled._n_user]]) if has_aux and outputs else aux
         result = RunResult(
             status="stopped_nonfinite" if bad_step is not None else "running",
             state=_unflatten(state_def, [Tensor(t) for t in current]),
