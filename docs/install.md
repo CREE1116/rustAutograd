@@ -1,6 +1,6 @@
 # 설치
 
-아직 패키지 저장소에 배포하지 않았으므로 소스에서 빌드합니다. Rust 1.80 이상과 Python 3.10 이상이 필요합니다.
+아직 패키지 저장소에 배포하지 않았으므로 소스에서 빌드합니다. Rust와 Python 3.10 이상이 필요합니다. `numpy`는 필수가 아닙니다.
 
 ```bash
 uv venv --python 3.13 .venv
@@ -12,6 +12,14 @@ uv pip install --python .venv/bin/python maturin numpy pytest
 
 ```bash
 .venv/bin/maturin develop --release
+```
+
+## wheel 만들기
+
+wheel 하나가 Python 3.10 이상 전체에서 동작합니다(abi3). macOS에서 Python 3.10, 3.13, 3.15의 깨끗한 환경으로 확인했습니다.
+
+```bash
+.venv/bin/maturin build --release --out dist
 ```
 
 ## 플랫폼

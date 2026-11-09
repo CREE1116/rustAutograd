@@ -5,7 +5,17 @@ build-backend = "maturin"
 [project]
 name = "rg"
 version = "0.2.0"
+description = "Define mathematics in Python; differentiate, compile, validate and run it in Rust"
+readme = "README.md"
 requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.optional-dependencies]
+dev = ["numpy", "pytest", "torch", "mkdocs-material"]
 
 [tool.maturin]
 features = ["python"]
