@@ -9,7 +9,7 @@ import pytest
 import rg
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-PAGES = sorted(glob.glob(os.path.join(ROOT, "docs", "*.md")))
+PAGES = sorted(glob.glob(os.path.join(ROOT, "docs", "*.md"))) + [os.path.join(ROOT, "README.md")]
 
 
 @pytest.mark.parametrize("page", PAGES, ids=[os.path.basename(p) for p in PAGES])

@@ -1,6 +1,7 @@
 site_name: rg
 site_description: Rust 기반 자동미분·텐서 컴파일 프레임워크
 docs_dir: docs
+repo_url: https://github.com/CREE1116/rustAutograd
 strict: true
 theme:
   name: material

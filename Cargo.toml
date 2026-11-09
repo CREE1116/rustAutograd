@@ -2,6 +2,8 @@
 name = "rg"
 version = "0.2.0"
 edition = "2021"
+description = "Define mathematics in Python; differentiate, compile, validate and run it in Rust"
+repository = "https://github.com/CREE1116/rustAutograd"
 
 [lib]
 name = "rg"
