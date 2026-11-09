@@ -28,6 +28,8 @@ def unflatten(structure_, values):
 
 def paths(t, prefix=""):
     """(dotted name, leaf) pairs, the names used by checkpoints."""
+    if t is None:
+        return []
     if isinstance(t, dict):
         return [p for k in sorted(t) for p in paths(t[k], f"{prefix}{k}.")]
     if isinstance(t, (tuple, list)):

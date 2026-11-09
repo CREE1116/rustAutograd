@@ -138,6 +138,7 @@ fn rematerialize(g: &Graph, outputs: &[u32], backward: &[bool], min_n: usize, co
         if let Op::Input(_) = n.op {
             h.cur_source = n.source.clone();
             map[i] = h.input(&n.shape, n.dtype);
+            h.nodes[map[i] as usize].op = n.op.clone();
             continue;
         }
         if !keep[i] {
@@ -197,6 +198,7 @@ fn simplify(g: &Graph, outputs: &[u32], metal: bool) -> (Graph, Vec<u32>, OptSta
         ng.cur_origin = None;
         if let Op::Input(_) = node.op {
             map[i] = ng.input(&node.shape, node.dtype);
+            ng.nodes[map[i] as usize].op = node.op.clone(); // reverse scans renumber their inputs
             backward.resize(ng.nodes.len(), false);
             continue;
         }
@@ -247,7 +249,7 @@ fn simplify(g: &Graph, outputs: &[u32], metal: bool) -> (Graph, Vec<u32>, OptSta
             }
         }
 
-        let foldable = !ins.is_empty() && node.n() <= FOLD_LIMIT && ins.iter().all(|&x| matches!(ng.nodes[x as usize].op, Op::Const(_)));
+        let foldable = !op.is_control_flow() && !matches!(op, Op::Output { .. }) && !ins.is_empty() && node.n() <= FOLD_LIMIT && ins.iter().all(|&x| matches!(ng.nodes[x as usize].op, Op::Const(_)));
         if foldable {
             let mut tmp = Graph::new();
             let ids: Vec<u32> = ins

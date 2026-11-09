@@ -48,6 +48,16 @@
 | `custom_vjp(f, bwd)` | 손으로 쓴 gradient 규칙 |
 | `stop_gradient(x)` | 값은 그대로, gradient는 차단 |
 
+## 제어 흐름
+
+| 이름 | 설명 |
+| --- | --- |
+| `scan(f, init, xs=None, length=None)` | `carry, y = f(carry, x)`를 그래프 노드 하나로 반복. 미분 가능. 바깥 값을 그대로 참조할 수 있음 |
+| `cond(pred, then_fn, else_fn, *args)` | 선택된 분기만 실행. 미분 가능 |
+| `while_loop(cond_fn, body_fn, init, max_iterations=100000)` | 값에 따라 길이가 달라지는 반복. 역전파 불가 |
+
+몇 스텝짜리 고정 루프는 Python `for`로 펼쳐도 같습니다. 길이가 길면 `scan`이 그래프를 작게 유지합니다.
+
 ## 생성
 
 `zeros`, `ones`, `full`, `zeros_like`, `ones_like`, `arange`, `linspace`, `eye`, `tril`
@@ -58,6 +68,7 @@
 | --- | --- |
 | 수학 | `exp`, `log`, `sqrt`, `sin`, `cos`, `tanh`, `abs`, `sign`, `floor`, `square`, `maximum`, `minimum`, `clip` |
 | 선택 | `where`, `equal`, `take`, `take_along_axis`, `argmax` |
+| 정렬 | `sort`, `argsort`, `top_k`, `cumsum` |
 | 형태 | `reshape`, `transpose`, `swapaxes`, `expand_dims`, `squeeze`, `broadcast_to`, `concatenate`, `stack` |
 | 선형대수 | `matmul` (N차원 배치와 브로드캐스트 지원) |
 
@@ -89,7 +100,7 @@ int32에서 되는 연산은 `+ - *`, 비교, `where`, 형태 연산, `take`, `c
 | 분류 | 이름 |
 | --- | --- |
 | 활성화 | `relu`, `gelu`, `sigmoid`, `silu`, `softplus`, `softmax`, `log_softmax`, `logsumexp` |
-| 유틸 | `one_hot`, `dropout` |
+| 유틸 | `one_hot`, `dropout`, `top_k_logits`, `top_p_logits` |
 | 손실 | `cross_entropy`, `mse_loss`, `l1_loss`, `binary_cross_entropy_with_logits` |
 | 지표 | `accuracy` |
 | 초기화 | `normal_init`, `xavier_uniform`, `kaiming_uniform` |

@@ -1,4 +1,4 @@
-use crate::graph::{Graph, Op, ReduceKind};
+use crate::graph::{Body, Graph, Op, ReduceKind};
 use crate::tensor::{Buf, DType, Elem, Storage, Tensor, VFn};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -135,6 +135,8 @@ pub struct Instr {
     pub arg_shapes: Vec<Vec<usize>>,
     pub n: usize,
     pub mode: Mode,
+    /// Control flow only: (output index, slot) of each output in use. `dst` is unused then.
+    pub outs: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +156,8 @@ pub struct Plan {
     pub input_slots: Vec<usize>,
     pub input_ns: Vec<usize>,
     pub outputs: Vec<Output>,
+    /// Built for diagnostics: control-flow bodies then use their reference plans too.
+    pub reference: bool,
     pub naive_bytes: usize,
     /// Largest total of intermediate values alive at once: what no allocator can beat in this order.
     pub peak_live_bytes: usize,
@@ -166,6 +170,10 @@ pub struct Frame {
 /// The executor is monomorphized over this, so the `()` observer leaves no trace in normal runs.
 pub trait Observer {
     fn after(&mut self, i: &Instr, slots: &[Buf]);
+    /// Instructions until `leave_body` belong to this body, at this iteration.
+    fn enter_body(&mut self, _body: &Arc<Body>, _iteration: usize) {}
+    fn leave_body(&mut self) {}
+    fn while_limit(&mut self, _i: &Instr) {}
 }
 
 impl Observer for () {
@@ -551,6 +559,9 @@ impl Plan {
                 }
             };
             let node = &g.nodes[i];
+            if matches!(node.op, Op::Output { .. }) {
+                continue; // its slot was allocated with the control-flow step
+            }
             if is_alias(g, i) {
                 let x = node.inputs[0] as usize;
                 let s = value_slot[x];
@@ -579,17 +590,29 @@ impl Plan {
             for &x in dying.iter().filter(|&&x| inplace(x)) {
                 a.release(value_slot[x as usize]);
             }
-            let dst = a.alloc(node.dtype, node.n());
+            let mut outs = vec![];
+            let dst = if node.op.is_control_flow() {
+                for (o, out) in g.nodes.iter().enumerate() {
+                    if let (true, Op::Output { index, .. }) = (keep[o] && out.inputs.first() == Some(&(i as u32)), &out.op) {
+                        let slot = a.alloc(out.dtype, out.n());
+                        value_slot[o] = slot;
+                        outs.push((*index, slot));
+                    }
+                }
+                usize::MAX
+            } else {
+                a.alloc(node.dtype, node.n())
+            };
             for &x in dying.iter().filter(|&&x| !inplace(x)) {
                 a.release(value_slot[x as usize]);
             }
             value_slot[i] = dst;
             naive_bytes += node.n() * node.dtype.size();
-            steps.push(Step::One(Instr { op: node.op.clone(), node: i as u32, dtype: node.dtype, dst, args, shape: node.shape.clone(), arg_shapes, n: node.n(), mode }));
+            steps.push(Step::One(Instr { op: node.op.clone(), node: i as u32, dtype: node.dtype, dst, args, shape: node.shape.clone(), arg_shapes, n: node.n(), mode, outs }));
         }
 
         let outputs = outputs.iter().map(|&o| Output { slot: value_slot[o as usize], shape: g.shape(o).to_vec(), n: g.nodes[o as usize].n() }).collect();
-        Plan { steps, slots: a.slots, pinned: a.pinned, consts, input_slots, input_ns, outputs, naive_bytes, peak_live_bytes: a.peak }
+        Plan { reference: !reuse, steps, slots: a.slots, pinned: a.pinned, consts, input_slots, input_ns, outputs, naive_bytes, peak_live_bytes: a.peak }
     }
 
     pub fn planned_bytes(&self) -> usize {
@@ -632,6 +655,7 @@ impl Plan {
     fn exec_step<O: Observer>(&self, s: &Step, f: &mut Frame, obs: &mut O) {
         {
             match s {
+                Step::One(i) if i.op.is_control_flow() => run_control(i, &mut f.slots, obs, self.reference),
                 Step::One(i) => {
                     exec_instr(i, &mut f.slots);
                     obs.after(i, &f.slots);
@@ -650,7 +674,13 @@ impl Plan {
 #[inline(always)]
 pub fn exec_instr(i: &Instr, s: &mut [Buf]) {
     match (i.dtype, &i.op) {
+        (_, op) if op.is_control_flow() => run_control(i, s, &mut (), false),
         (_, Op::Cast(_)) => cast(i, s),
+        (_, Op::ArgTopK { k }) => match s[i.args[0]].dtype() {
+            DType::F32 => arg_top_k::<f32>(i, s, *k),
+            DType::F64 => arg_top_k::<f64>(i, s, *k),
+            DType::I32 => unreachable!("arg_top_k is float-only"),
+        },
         (_, Op::KeySplit { .. }) => key_split(i, s),
         (_, Op::Argmax) => match s[i.args[0]].dtype() {
             DType::F32 => argmax::<f32>(i, s),
@@ -660,6 +690,178 @@ pub fn exec_instr(i: &Instr, s: &mut [Buf]) {
         (DType::F32, _) => step::<f32>(i, s),
         (DType::F64, _) => step::<f64>(i, s),
         (DType::I32, _) => step_int(i, s),
+    }
+}
+
+fn body_plan(body: &Body, reference: bool) -> &Plan {
+    if reference {
+        &body.reference
+    } else {
+        &body.fast
+    }
+}
+
+fn load_inputs(plan: &Plan, f: &mut Frame, s: &[Buf], args: &[usize]) {
+    for (k, &arg) in args.iter().enumerate() {
+        f.slots[plan.input_slots[k]].copy_prefix_from(&s[arg], plan.input_ns[k]);
+    }
+}
+
+/// Copies body outputs into the carry inputs. Goes through copies because an output may be
+/// another carry's input.
+fn feed_carry(plan: &Plan, f: &mut Frame, n_carry: usize) {
+    let next: Vec<Buf> = plan.outputs[..n_carry].iter().map(|o| f.slots[o.slot].prefix(o.n)).collect();
+    for (k, b) in next.iter().enumerate() {
+        f.slots[plan.input_slots[k]].copy_prefix_from(b, b.len());
+    }
+}
+
+fn run_control<O: Observer>(i: &Instr, s: &mut [Buf], obs: &mut O, reference: bool) {
+    match &i.op {
+        Op::Scan { body, n_carry, n_x, length, reverse } => {
+            let plan = body_plan(body, reference);
+            let (c, x) = (*n_carry, *n_x);
+            let n_y = plan.outputs.len() - c;
+            let mut f = plan.frame();
+            // Carries and captures once; the xs change every step.
+            for (k, &arg) in i.args.iter().enumerate() {
+                if k < c || k >= c + x {
+                    f.slots[plan.input_slots[k]].copy_prefix_from(&s[arg], plan.input_ns[k]);
+                }
+            }
+            for step in 0..*length {
+                let at = if *reverse { *length - 1 - step } else { step };
+                for k in c..c + x {
+                    let m = plan.input_ns[k];
+                    f.slots[plan.input_slots[k]].copy_range_from(0, &s[i.args[k]], at * m, m);
+                }
+                for &(index, slot) in &i.outs {
+                    if index >= c + n_y {
+                        let k = index - c - n_y;
+                        let m = plan.input_ns[k];
+                        s[slot].copy_range_from(at * m, &f.slots[plan.input_slots[k]], 0, m);
+                    }
+                }
+                obs.enter_body(body, at);
+                plan.exec(&mut f, obs);
+                obs.leave_body();
+                for &(index, slot) in &i.outs {
+                    if (c..c + n_y).contains(&index) {
+                        let o = &plan.outputs[index];
+                        s[slot].copy_range_from(at * o.n, &f.slots[o.slot], 0, o.n);
+                    }
+                }
+                feed_carry(plan, &mut f, c);
+            }
+            for &(index, slot) in &i.outs {
+                if index < c {
+                    s[slot].copy_prefix_from(&f.slots[plan.input_slots[index]], plan.input_ns[index]);
+                }
+            }
+        }
+        Op::While { cond, body, n_carry, max_iterations } => {
+            let (cp, bp) = (body_plan(cond, reference), body_plan(body, reference));
+            let (mut cf, mut bf) = (cp.frame(), bp.frame());
+            load_inputs(cp, &mut cf, s, &i.args);
+            load_inputs(bp, &mut bf, s, &i.args);
+            let mut count = 0;
+            loop {
+                obs.enter_body(cond, count);
+                cp.exec(&mut cf, obs);
+                obs.leave_body();
+                let o = &cp.outputs[0];
+                if cf.slots[o.slot].prefix(1).to_f64()[0] == 0.0 {
+                    break;
+                }
+                if count == *max_iterations {
+                    obs.while_limit(i);
+                    break;
+                }
+                obs.enter_body(body, count);
+                bp.exec(&mut bf, obs);
+                obs.leave_body();
+                feed_carry(bp, &mut bf, *n_carry);
+                for k in 0..*n_carry {
+                    cf.slots[cp.input_slots[k]].copy_prefix_from(&bf.slots[bp.input_slots[k]], bp.input_ns[k]);
+                }
+                count += 1;
+            }
+            for &(index, slot) in &i.outs {
+                if index < *n_carry {
+                    s[slot].copy_prefix_from(&bf.slots[bp.input_slots[index]], bp.input_ns[index]);
+                } else {
+                    i32::slice_mut(&mut s[slot])[0] = count as i32;
+                }
+            }
+        }
+        Op::Cond { then_body, else_body } => {
+            let taken = s[i.args[0]].prefix(1).to_f64()[0] != 0.0;
+            let body = if taken { then_body } else { else_body };
+            let plan = body_plan(body, reference);
+            let mut f = plan.frame();
+            load_inputs(plan, &mut f, s, &i.args[1..]);
+            obs.enter_body(body, 0);
+            plan.exec(&mut f, obs);
+            obs.leave_body();
+            for &(index, slot) in &i.outs {
+                let o = &plan.outputs[index];
+                s[slot].copy_prefix_from(&f.slots[o.slot], o.n);
+            }
+        }
+        other => unreachable!("{} is not control flow", other.name()),
+    }
+}
+
+fn arg_top_k<T: Elem>(i: &Instr, s: &mut [Buf], k: usize) {
+    let v = *i.arg_shapes[0].last().expect("checked by infer");
+    let mut db = take(s, i.dst);
+    let a = T::slice(&s[i.args[0]]);
+    let n_in: usize = i.arg_shapes[0].iter().product();
+    // A total order: larger first, ties by index, NaN last.
+    let rank = |row: &[T], x: i32, y: i32| -> std::cmp::Ordering {
+        let (p, q) = (row[x as usize], row[y as usize]);
+        match q.partial_cmp(&p) {
+            Some(std::cmp::Ordering::Equal) => x.cmp(&y),
+            Some(order) => order,
+            None => (p != p).cmp(&(q != q)).then(x.cmp(&y)),
+        }
+    };
+    let select = |(out, row): (&mut [i32], &[T])| {
+        let mut idx: Vec<i32> = (0..v as i32).collect();
+        if k < v {
+            idx.select_nth_unstable_by(k - 1, |&x, &y| rank(row, x, y));
+        }
+        idx[..k].sort_unstable_by(|&x, &y| rank(row, x, y));
+        out.copy_from_slice(&idx[..k]);
+    };
+    let dst = &mut i32::slice_mut(&mut db)[..i.n];
+    if n_in >= PARALLEL_MINMAX {
+        dst.par_chunks_mut(k).zip(a[..n_in].par_chunks_exact(v)).for_each(select);
+    } else {
+        dst.chunks_mut(k).zip(a[..n_in].chunks_exact(v)).for_each(select);
+    }
+    s[i.dst] = db;
+}
+
+fn cumsum<T: Storage + std::ops::Add<Output = T>>(i: &Instr, s: &[Buf], reverse: bool, dst: &mut [T]) {
+    let v = *i.shape.last().expect("checked by infer");
+    let a = T::slice(&s[i.args[0]]);
+    if v == 0 {
+        return;
+    }
+    for (o, r) in dst.chunks_exact_mut(v).zip(a[..i.n].chunks_exact(v)) {
+        let mut acc = T::ZERO;
+        if reverse {
+            for j in (0..v).rev() {
+                acc = acc + r[j];
+                o[j] = acc;
+            }
+        } else {
+            for j in 0..v {
+                acc = acc + r[j];
+                o[j] = acc;
+            }
+        }
     }
 }
 
@@ -1031,6 +1233,11 @@ fn step<T: Elem>(i: &Instr, s: &mut [Buf]) {
         Gt => binary::<T>(i, s, |a, b| if a > b { T::ONE } else { T::ZERO }),
         Ge => binary::<T>(i, s, |a, b| if a >= b { T::ONE } else { T::ZERO }),
         Floor => unary::<T>(i, s, T::floor),
+        Cumsum { reverse } => {
+            let mut db = take(s, i.dst);
+            cumsum::<T>(i, s, *reverse, &mut T::slice_mut(&mut db)[..i.n]);
+            s[i.dst] = db;
+        }
         Where | Transpose(_) | BroadcastTo(_) | Slice { .. } | Pad { .. } | Concat { .. } | Take { .. } | TakeAlong => with_dst::<T>(i, s, structural::<T>),
         _ => with_dst::<T>(i, s, numeric::<T>),
     }
@@ -1051,6 +1258,11 @@ fn step_int(i: &Instr, s: &mut [Buf]) {
         Mul => binary::<i32>(i, s, i32::wrapping_mul),
         Gt => binary::<i32>(i, s, |a, b| (a > b) as i32),
         Ge => binary::<i32>(i, s, |a, b| (a >= b) as i32),
+        Cumsum { reverse } => {
+            let mut db = take(s, i.dst);
+            cumsum::<i32>(i, s, *reverse, &mut i32::slice_mut(&mut db)[..i.n]);
+            s[i.dst] = db;
+        }
         _ => with_dst::<i32>(i, s, structural::<i32>),
     }
 }

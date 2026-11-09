@@ -141,7 +141,7 @@ M4 Pro 한 대, GPT와 MLP 벤치마크뿐이므로 다른 모델이나 NVIDIA �
 | Metal (Apple GPU) | 지원, `rg.compile(..., device="metal")` |
 | Linux, Windows | 순수 Rust 커널로 빌드. 행렬곱이 BLAS보다 많이 느림 |
 | CUDA | 미지원 |
-| 그래프 내 제어 흐름 (`scan`, `while_loop`) | 미지원. 고정 횟수는 Python 루프가 펼쳐지고, 분기는 `rg.where` |
+| 제어 흐름 | `scan`, `cond`(미분 가능), `while_loop`. 현재 본문은 CPU에서 실행 |
 | 동적 shape | 미지원. 입력 shape가 바뀌면 재컴파일 |
 | dtype | `float32`, `float64`(GPU에서는 CPU로 실행), `int32` |
 

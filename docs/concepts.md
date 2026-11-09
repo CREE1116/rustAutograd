@@ -22,8 +22,24 @@ good = rg.compile(lambda x: rg.where(x.sum() > 0.0, x, -x), (rg.tensor([1.0]),))
 assert good(rg.tensor([-3.0])).tolist() == [3.0]
 ```
 
-!!! warning "지금 없는 제어 흐름"
-    `while_loop`, `cond`, `scan` 같은 그래프 내 제어 흐름은 없습니다. 고정 횟수 반복은 Python 루프로 펼치고, 조건은 `rg.where`로 씁니다. 길이가 값에 따라 달라지는 루프는 표현할 수 없습니다.
+값에 따라 달라지는 흐름에는 전용 연산을 씁니다.
+
+```python
+def count_steps(a):
+    def body(s):
+        return {"x": 0.5 * (s["x"] + a / s["x"]), "n": s["n"] + 1}
+    return rg.while_loop(lambda s: abs(s["x"] * s["x"] - a) > 1e-6, body, {"x": a, "n": rg.tensor(0, "int32")})
+
+newton = rg.compile(count_steps, (rg.tensor(2.0, "float64"),))
+assert abs(float(newton(rg.tensor(2.0, "float64"))["x"]) - 2 ** 0.5) < 1e-6
+
+# scan은 미분 가능한 고정 길이 반복, cond는 선택된 분기만 실행합니다.
+total, running = rg.scan(lambda c, x: (c + x, c + x), rg.tensor(0.0), rg.arange(4, "float32"))
+assert running.tolist() == [0.0, 1.0, 3.0, 6.0]
+assert float(rg.cond(rg.tensor(0.0), lambda v: v.log(), lambda v: v * v, rg.tensor(-3.0))) == 9.0
+```
+
+`where`는 두 값을 모두 계산한 뒤 고릅니다. `cond`는 고른 쪽만 계산하므로, 고르지 않은 쪽의 NaN이 생기지 않습니다. 진단은 본문 안의 노드와 반복 번호까지 가리킵니다.
 
 ## 컴파일 단계
 
@@ -76,7 +92,7 @@ if "metal" in rg.devices():
 
 - shape가 정적이므로 연산마다 MSL 커널을 생성합니다. 원소 연산은 하나의 커널로 합쳐지고, 큰 행렬곱은 Metal Performance Shaders를 씁니다.
 - 통합 메모리를 쓰므로 CPU와 GPU가 같은 버퍼를 봅니다. 파라미터를 GPU에서 학습한 뒤 CPU에서 샘플링하는 일에 변환이 필요 없습니다.
-- `float64`, 정규 분포 샘플링, `take`의 역전파처럼 GPU 커널이 없거나 CPU가 더 나은 연산은 대기열을 비운 뒤 CPU에서 실행합니다. 프로그램은 그대로 동작하지만, `float64`가 많으면 GPU 이득이 사라집니다.
+- `float64`, 정규 분포 샘플링, `take`의 역전파, 정렬, 제어 흐름은 대기열을 비운 뒤 CPU에서 실행합니다. `scan` 본문은 GPU에서 돌지 않습니다. 프로그램은 그대로 동작하지만, `float64`가 많으면 GPU 이득이 사라집니다.
 - 진단과 유한차분 검사는 항상 CPU 기준 그래프에서 실행합니다. `standard` 이상에서는 GPU 결과를 CPU와 비교하는 `device_equivalence` 검사가 추가됩니다.
 - 같은 키의 균등 난수는 CPU와 비트 단위로 같습니다. 그 밖의 부동소수점 결과는 반올림 수준에서 다를 수 있으므로, 디바이스를 바꾸면 비트 단위 재현은 보장하지 않습니다.
 - 수학 함수의 NaN·Inf 동작은 빠른 수학을 끄고 CPU에 맞췄습니다. CPU와 대조하는 테스트로 확인하며, 아주 큰 값의 삼각함수 정밀도는 비교하지 않습니다.

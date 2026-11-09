@@ -110,6 +110,9 @@ assert again["diagnostics"][0]["node"]["id"] == root["node"]["id"]
 | `ARITY_MISMATCH` | 연산의 입력 개수가 틀림 (엔진 사용 오류) | 버그 신고 |
 | `CONTROL_FLOW_ON_TRACER` | 추적값을 `bool`, `float` 등으로 변환 | `rg.where` 사용 |
 | `TRACER_LEAK` | 끝난 추적의 Tracer를 밖에서 사용 | 값을 함수 반환으로 꺼내기 |
+| `CONTROL_FLOW_SHAPE_MISMATCH` | 본문이 상태의 구조·shape·dtype을 바꿈, 두 분기의 결과가 다름, xs 길이가 다름 | 본문 수정 |
+| `WHILE_LIMIT_REACHED` | `while_loop`가 `max_iterations`에서 멈춤. 검증 때만 보고 | 조건 확인, 한도 조정 |
+| `GRAD_THROUGH_WHILE` | `while_loop`의 역전파 시도 | 고정 길이 `scan` 사용 |
 | `GRAD_NON_SCALAR` | 스칼라가 아닌 출력의 미분 | `.sum()`, `.mean()` |
 | `GRAD_OF_INTEGER` | 정수의 미분 | 실수 입력만 미분 |
 | `GRAD_DISCONNECTED` | 출력이 입력에 의존하지 않음 (경고) | 그래프 연결 확인 |
@@ -128,7 +131,7 @@ assert again["diagnostics"][0]["node"]["id"] == root["node"]["id"]
 | `DEVICE_UNAVAILABLE` | 없는 디바이스 요청, Metal 장치 없음, 단일 버퍼가 장치 한계 초과, 생성 커널 컴파일 실패 | `rg.devices()` 확인 |
 | `DEVICE_EXECUTION_FAILED` | GPU가 명령 실패를 보고했거나 메모리를 할당하지 못함. `run`에서는 `observation.completed_steps`도 담음 | 메모리 확인, 모델 축소, CPU로 재현 |
 | `DEVICE_MISMATCH` | GPU 결과가 CPU와 다름 (경고, `suspected`) | 정규화가 반올림을 증폭해도 생길 수 있음. 값 차이 확인 |
-| `PLAN_NEAR_PHYSICAL_MEMORY` | 중간 버퍼 계획이 물리 메모리의 절반 초과 (경고, `suspected`). 스왑으로 몇 배 느려질 수 있음 | 배치나 모델 축소, `report["memory"]` 확인 |
+| `PLAN_NEAR_PHYSICAL_MEMORY` | 중간 버퍼 계획이 물리 메모리의 절반 초과 (경고, `suspected`). 스왑으로 몇 배 느려질 수 있음. Windows에서는 메모리를 조회하지 않아 보고되지 않음 | 배치나 모델 축소, `report["memory"]` 확인 |
 | `REPLAY_DID_NOT_REPRODUCE` | 재생에서 실패가 재현되지 않음 (`unknown`) | 입력의 결정성 확인 |
 | `NONFINITE_NOT_LOCALIZED` | 빠른 계획은 실패했으나 기준 실행은 유한 (`unknown`) | 오버플로 경계의 반올림 차이일 수 있음 |
 

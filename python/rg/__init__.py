@@ -3,10 +3,10 @@
 from . import _rg
 from ._core import (
     Compiled, DiagnosticError, Report, RunResult, Tensor, Tracer, _Ops,
-    abs, arange, argmax, broadcast_to, clip, compile, concatenate, cos, custom_vjp, devices, equal, exp,
+    abs, arange, argmax, argsort, broadcast_to, clip, compile, concatenate, cond, cos, cumsum, custom_vjp, devices, equal, exp,
     expand_dims, eye, floor, full, grad, hessian, inspect, jvp, linspace, log, matmul, maximum,
     minimum, ones, ones_like, reshape, run, sign, sin, sqrt, square, squeeze, stack, stop_gradient,
-    swapaxes, take, take_along_axis, tanh, tensor, transpose, tril, value_and_grad, where, zeros,
+    swapaxes, scan, sort, take, take_along_axis, tanh, tensor, top_k, transpose, tril, value_and_grad, where, while_loop, zeros,
     zeros_like,
 )
 from . import nn, optim, random, tree

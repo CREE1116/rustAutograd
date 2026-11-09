@@ -388,3 +388,35 @@ fn gpu_failure_reaches_the_caller_as_a_diagnostic_and_stops_the_run() {
     assert!(ok.device_error.is_none());
     assert_eq!(ok.state[0].data.to_f64(), [0.5, 1.0, 1.5, 2.0]);
 }
+
+#[test]
+fn sort_and_control_flow_run_through_the_cpu_fallback_on_metal() {
+    let input = seq(&[3, 8]);
+    agree(|g, i| g.add(Op::ArgTopK { k: 3 }, &[i[0]]).unwrap(), std::slice::from_ref(&input), "arg_top_k");
+    agree(|g, i| g.add(Op::Cumsum { reverse: true }, &[i[0]]).unwrap(), std::slice::from_ref(&input), "cumsum");
+
+    let mut b = Graph::new();
+    let (c, x) = (b.input(&[8], F), b.input(&[8], F));
+    let m = b.add(Op::Mul, &[c, x]).unwrap();
+    let next = b.add(Op::Tanh, &[m]).unwrap();
+    let body = rg::graph::Body::new(b, vec![next, m]);
+    let mut g = Graph::new();
+    let (c0, xs) = (g.input(&[8], F), g.input(&[3, 8], F));
+    let d = g.add(Op::Tanh, &[c0]).unwrap(); // GPU work before and after the loop
+    let node = g.add(Op::Scan { body, n_carry: 1, n_x: 1, length: 3, reverse: false }, &[d, xs]).unwrap();
+    let last = g.add(Op::Output { index: 0, shape: vec![8], dtype: F }, &[node]).unwrap();
+    let ys = g.add(Op::Output { index: 1, shape: vec![3, 8], dtype: F }, &[node]).unwrap();
+    let e = g.add(Op::Exp, &[last]).unwrap();
+    let axes = vec![0];
+    let s = g.add(Op::Reduce { kind: ReduceKind::Sum, axes, keepdims: false }, &[e]).unwrap();
+    let gr = grad(&mut g, s, &[c0, xs]).unwrap();
+    let c0v = seq(&[8]);
+    let args = [&c0v, &input];
+    let mut outs = vec![last, ys];
+    outs.extend(gr);
+    let (o, ids, _) = optimize(&g, &outs);
+    let (gpu, cpu) = (on_gpu(&o, &ids, &args), eval(&g, &outs, &args));
+    for k in 0..outs.len() {
+        close(&gpu[k], &cpu[k], 1e-3, &format!("scan output {k}"));
+    }
+}

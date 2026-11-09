@@ -473,6 +473,7 @@ def test_gpt_trains_samples_and_diagnoses_on_metal():
     assert next(d for d in rg.inspect(res)["diagnostics"] if d["severity"] == "error")["code"] == "NUMERIC_OVERFLOW"
 
 
+@pytest.mark.skipif(not hasattr(os, "sysconf"), reason="physical memory is not queried on this platform")
 def test_a_plan_near_physical_memory_warns_before_it_runs(monkeypatch):
     x = rg.zeros((256, 256))
     assert rg.compile(lambda a: (a @ a).tanh().sum(), (x,), validate="none").report["status"] == "ok"
@@ -482,3 +483,220 @@ def test_a_plan_near_physical_memory_warns_before_it_runs(monkeypatch):
     assert d["severity"] == "warning" and d["diagnosis"]["certainty"] == "suspected"
     assert c.report["status"] == "warning"
     assert c.report.ok
+
+
+# Sorting, top-k and control flow, through the public API.
+
+
+def test_sort_and_top_k_match_numpy_and_pytorch():
+    r = np.random.default_rng(8)
+    a = r.normal(size=(4, 6))
+    x = f64(a)
+    np.testing.assert_array_equal(rg.sort(x).numpy(), np.sort(a, -1))
+    np.testing.assert_array_equal(rg.sort(x, axis=0).numpy(), np.sort(a, 0))
+    np.testing.assert_array_equal(rg.sort(x, descending=True).numpy(), -np.sort(-a, -1))
+    np.testing.assert_array_equal(rg.argsort(x).numpy(), np.argsort(a, -1, kind="stable"))
+    values, idx = rg.top_k(x, 3)
+    tv, ti = torch.topk(torch.tensor(a), 3)
+    np.testing.assert_array_equal(values.numpy(), tv.numpy())
+    np.testing.assert_array_equal(idx.numpy(), ti.numpy())
+    np.testing.assert_array_equal(rg.top_k(x, 2, axis=0)[0].numpy(), torch.topk(torch.tensor(a), 2, dim=0)[0].numpy())
+    np.testing.assert_allclose(rg.cumsum(x, axis=0).numpy(), np.cumsum(a, 0))
+    assert rg.argsort(rg.tensor([2.0, float("nan"), 1.0])).tolist() == [2, 0, 1]
+
+    # Gradients follow each value back to where it came from.
+    ta = torch.tensor(a, requires_grad=True)
+    w = torch.arange(6.0, dtype=torch.float64)
+    (torch.sort(ta, -1)[0] * w).sum().backward()
+    g = rg.grad(lambda v: (rg.sort(v) * f64(np.arange(6.0))).sum())(x)
+    np.testing.assert_allclose(g.numpy(), ta.grad.numpy())
+
+
+def test_sampling_filters():
+    logits = f64(np.log([[0.5, 0.2, 0.15, 0.1, 0.05]]))
+    kept = lambda f: (f.numpy() > -1e8).tolist()[0]
+    assert kept(nn.top_k_logits(logits, 2)) == [True, True, False, False, False]
+    assert kept(nn.top_p_logits(logits, 0.6)) == [True, True, False, False, False]
+    assert kept(nn.top_p_logits(logits, 0.45)) == [True, False, False, False, False]
+    assert kept(nn.top_p_logits(logits, 0.9)) == [True, True, True, True, False]
+    assert kept(nn.top_p_logits(logits, 1e-6)) == [True, False, False, False, False]
+    shuffled = f64(np.log([[0.1, 0.5, 0.05, 0.2, 0.15]]))
+    assert kept(nn.top_p_logits(shuffled, 0.6)) == [False, True, False, True, False]
+    # Sampling respects the filter, inside a compiled step too.
+    c = rg.compile(lambda k: random.categorical(k, nn.top_k_logits(rg.tensor(np.log([[0.6, 0.3, 0.1]] * 500), "float32"), 2)), (random.key(0),))
+    assert set(c(random.key(1)).tolist()) == {0, 1}
+
+
+def test_gpt_sampler_with_top_k_and_top_p_stays_on_the_pattern():
+    text = "abcd" * 100
+    chars = sorted(set(text))
+    tokens = rg.tensor(np.array([chars.index(c) for c in text], dtype="int32"))
+    model = gpt_example.GPT(vocab=4, block=4, d=16, heads=2, layers=1)
+    params = model.init(random.key(0))
+    opt = optim.adamw(5e-3, weight_decay=0.0)
+    state = {"params": params, "opt": opt.init(params), "key": random.key(1)}
+    r = rg.run(rg.compile(gpt_example.make_train_step(model, opt, 8), (state, tokens)), state, tokens, steps=200)
+    for kw in ({"top_k": 1}, {"top_p": 0.5}):
+        s = gpt_example.compile_sampler(model, r.state["params"], **kw)
+        assert "".join(chars[t] for t in gpt_example.generate(s, 4, [0, 1, 2, 3], 8)) == "abcdabcd"
+
+
+def rnn_loss_scan(p, xs):
+    def cell(h, x):
+        h = rg.tanh(h * p["w"] + x + p["b"])
+        return h, h * h
+
+    last, ys = rg.scan(cell, rg.zeros_like(p["b"]), xs)
+    return last.sum() + ys.mean()
+
+
+def rnn_loss_loop(p, xs):
+    h, total = rg.zeros_like(p["b"]), []
+    for k in range(xs.shape[0]):
+        h = rg.tanh(h * p["w"] + xs[k] + p["b"])
+        total.append(h * h)
+    return h.sum() + rg.stack(total).mean()
+
+
+def test_scan_gradient_equals_the_python_loop_and_pytorch():
+    r = np.random.default_rng(9)
+    p = {"w": f64(r.normal(size=3)), "b": f64(r.normal(size=3))}
+    xs = f64(r.normal(size=(20, 3)))
+    v1, g1 = rg.value_and_grad(rnn_loss_scan)(p, xs)
+    v2, g2 = rg.value_and_grad(rnn_loss_loop)(p, xs)
+    assert float(v1) == pytest.approx(float(v2), rel=1e-13)
+    tp = {k: torch.tensor(v.numpy(), requires_grad=True) for k, v in p.items()}
+    txs, h, total = torch.tensor(xs.numpy()), torch.zeros(3, dtype=torch.float64), []
+    for k in range(20):
+        h = torch.tanh(h * tp["w"] + txs[k] + tp["b"])
+        total.append(h * h)
+    tv = h.sum() + torch.stack(total).mean()
+    tv.backward()
+    assert float(v1) == pytest.approx(tv.item(), rel=1e-13)
+    for k in p:
+        np.testing.assert_allclose(g1[k].numpy(), g2[k].numpy(), rtol=1e-11)
+        np.testing.assert_allclose(g1[k].numpy(), tp[k].grad.numpy(), rtol=1e-11)
+
+
+def test_scan_keeps_the_graph_small_and_validates():
+    p = {"w": rg.tensor([0.5, 0.2]), "b": rg.tensor([0.1, -0.1])}
+    xs = rg.tensor(np.random.default_rng(0).normal(size=(500, 2)).astype("float32"))
+    compact = rg.compile(rg.grad(rnn_loss_scan), (p, xs), validate="thorough")
+    unrolled = rg.compile(rg.grad(rnn_loss_loop), (p, xs), validate="none")
+    assert compact.report["status"] == "ok", compact.report
+    assert compact.report["graph"]["optimization"]["nodes_after"] * 20 < unrolled.report["graph"]["optimization"]["nodes_after"]
+    assert next(c for c in compact.report["checks"] if c["name"] == "grad_check")["detail"]["elements_checked"] == 4
+
+
+def test_scan_structures_captures_and_errors():
+    # Trees in carry, x and y; a captured outer value; no xs.
+    scale = rg.tensor(2.0, "float64")
+
+    def body(c, x):
+        return {"a": c["a"] + x["v"] * scale, "n": c["n"]}, {"out": c["a"]}
+
+    c0 = {"a": f64([0.0]), "n": f64([5.0])}
+    final, ys = rg.scan(body, c0, {"v": f64([[1.0], [2.0], [3.0]])})
+    assert final["a"].tolist() == [12.0] and final["n"].tolist() == [5.0]
+    assert ys["out"].numpy().tolist() == [[0.0], [2.0], [6.0]]
+    last, none = rg.scan(lambda c, _: (c * 2.0, None), f64(1.0), length=4)
+    assert float(last) == 16.0 and none is None
+
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.scan(lambda c, _: (c.reshape(1, 1), None), f64([1.0]), length=2)
+    assert e.value.diagnostic["code"] == "CONTROL_FLOW_SHAPE_MISMATCH"
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.scan(lambda c, _: (c, None), f64([1.0]))
+    assert e.value.diagnostic["code"] == "CONTROL_FLOW_SHAPE_MISMATCH"
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.scan(lambda c, x: (c, x), f64([1.0]), (f64([1.0, 2.0]), f64([1.0])))
+    assert e.value.diagnostic["code"] == "CONTROL_FLOW_SHAPE_MISMATCH"
+    # Ordinary Python if is still rejected inside a body, with the remedy.
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.scan(lambda c, _: (c if c.sum() > 0 else -c, None), f64([1.0]), length=2)
+    assert e.value.diagnostic["code"] == "CONTROL_FLOW_ON_TRACER"
+
+
+def test_nested_scan_in_a_training_step_with_random_keys():
+    def inner(c, _):
+        return c * 0.5 + 1.0, None
+
+    def outer(c, x):
+        k1, k2 = random.split(c["key"])
+        h, _ = rg.scan(inner, c["h"] + x + random.normal(k1, (2,), "float64") * 0.0, length=3)
+        return {"key": k2, "h": h}, h.sum()
+
+    def loss(w, xs):
+        final, ys = rg.scan(outer, {"key": random.key(0), "h": w}, xs)
+        return final["h"].sum() + ys.sum()
+
+    w = f64([0.3, 0.4])
+    xs = f64(np.ones((4, 2)))
+    g = rg.grad(loss)(w, xs)
+    h = 1e-6
+    for i in range(2):
+        d = np.zeros(2)
+        d[i] = h
+        numeric = (float(loss(f64(w.numpy() + d), xs)) - float(loss(f64(w.numpy() - d), xs))) / (2 * h)
+        assert g.numpy()[i] == pytest.approx(numeric, rel=1e-6)
+
+
+def test_while_loop_newton_and_its_limits():
+    # Newton iteration for sqrt(a): the iteration count depends on the value.
+    def sqrt_newton(a):
+        def cond(s):
+            return abs(s["x"] * s["x"] - a) > 1e-10
+
+        def body(s):
+            return {"x": 0.5 * (s["x"] + a / s["x"]), "n": s["n"] + 1}
+
+        return rg.while_loop(cond, body, {"x": a, "n": rg.tensor(0, "int32")})
+
+    c = rg.compile(sqrt_newton, (f64(2.0),))
+    assert c.report["status"] == "ok", c.report
+    a, b = c(f64(2.0)), c(f64(1e6))
+    assert float(a["x"]) == pytest.approx(2 ** 0.5)
+    assert float(b["x"]) == pytest.approx(1e3)
+    assert int(b["n"]) > int(a["n"])
+
+    stuck = rg.compile(lambda s: rg.while_loop(lambda v: v < 1e9, lambda v: v, s, max_iterations=5), (f64(1.0),))
+    assert stuck.report["diagnostics"][0]["code"] == "WHILE_LIMIT_REACHED"
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.grad(lambda v: rg.while_loop(lambda s: s < 10.0, lambda s: s * 2.0, v))(f64(1.0))
+    assert e.value.diagnostic["code"] == "GRAD_THROUGH_WHILE"
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.while_loop(lambda s: s, lambda s: s, f64([1.0, 2.0]))
+    assert e.value.diagnostic["code"] == "CONTROL_FLOW_SHAPE_MISMATCH"
+
+
+def test_cond_is_lazy_differentiable_and_checks_branches():
+    def f(x, flag):
+        return rg.cond(flag, lambda v: v.log(), lambda v: v * v, x)
+
+    assert float(f(f64(-3.0), f64(0.0))) == 9.0  # log(-3) never runs
+    assert float(rg.grad(f)(f64(2.0), f64(1.0))) == 0.5
+    assert float(rg.grad(f)(f64(2.0), f64(0.0))) == 4.0
+    good = rg.compile(f, (f64(-3.0), f64(0.0)))
+    assert good.report["status"] == "ok", good.report
+    bad = good.check(f64(-3.0), f64(1.0))
+    assert bad["diagnostics"][0]["diagnosis"]["cause"] == "log_of_negative"
+
+    # Captured outer values in only one branch.
+    k = f64(10.0)
+    assert float(rg.cond(f64(1.0), lambda v: v + k, lambda v: v, f64(1.0))) == 11.0
+    assert float(rg.cond(f64(0.0), lambda v: v, lambda v: v + k, f64(1.0))) == 11.0
+    with pytest.raises(rg.DiagnosticError) as e:
+        rg.cond(f64(1.0), lambda v: v, lambda v: v.reshape(1), f64(1.0))
+    assert e.value.diagnostic["code"] == "CONTROL_FLOW_SHAPE_MISMATCH"
+
+
+@metal
+def test_control_flow_runs_on_metal():
+    p = {"w": rg.tensor([0.5, 0.2]), "b": rg.tensor([0.1, -0.1])}
+    xs = rg.tensor(np.random.default_rng(0).normal(size=(50, 2)).astype("float32"))
+    fn = rg.value_and_grad(rnn_loss_scan)
+    cpu, gpu = rg.compile(fn, (p, xs)), rg.compile(fn, (p, xs), device="metal")
+    assert gpu.report["status"] == "ok", gpu.report
+    (va, ga), (vb, gb) = cpu(p, xs), gpu(p, xs)
+    assert float(va) == pytest.approx(float(vb), rel=1e-4)
+    np.testing.assert_allclose(ga["w"].numpy(), gb["w"].numpy(), rtol=1e-3, atol=1e-5)

@@ -355,7 +355,7 @@ enum MetalStep {
     Dispatch { pipeline: usize, slots: Vec<usize>, grid: usize, width: usize, writes: usize, barrier: bool },
     /// Apple's matrix multiply; `slots` are left, right, result.
     Mps { kernel: Retained<MPSMatrixMultiplication>, slots: [usize; 3], descriptors: [Retained<MPSMatrixDescriptor>; 3] },
-    /// Runs on the CPU with `instr`'s slots renumbered to `slots` order; the last one is the output.
+    /// Runs on the CPU with `instr`'s slots renumbered: `slots` lists arguments, then outputs.
     Cpu { instr: Instr, slots: Vec<usize>, arg_ns: Vec<usize> },
 }
 
@@ -438,9 +438,16 @@ impl MetalProgram {
                 let Step::One(i) = step else { unreachable!("groups always generate") };
                 let mut instr = i.clone();
                 instr.args = (0..i.args.len()).collect();
-                instr.dst = i.args.len();
                 let mut slots = i.args.clone();
-                slots.push(i.dst);
+                if i.op.is_control_flow() {
+                    for (k, out) in instr.outs.iter_mut().enumerate() {
+                        slots.push(out.1);
+                        out.1 = i.args.len() + k;
+                    }
+                } else {
+                    instr.dst = i.args.len();
+                    slots.push(i.dst);
+                }
                 let arg_ns = i.arg_shapes.iter().map(|s| s.iter().product()).collect();
                 pending.push(MetalStep::Cpu { instr, slots, arg_ns });
                 continue;
@@ -658,11 +665,13 @@ impl MetalExec<'_> {
                     finish(&mut cb, &mut enc, &mut waited);
                     let t0 = std::time::Instant::now();
                     stats.cpu_steps += 1;
-                    let last = slots.len() - 1;
-                    let mut bufs: Vec<Buf> = slots[..last].iter().zip(arg_ns).map(|(&s, &n)| read_bytes(&self.buffers[s], self.plan.slots[s].0, n)).collect();
-                    bufs.push(Buf::zeros(instr.dtype, instr.n));
+                    let n_args = arg_ns.len();
+                    let mut bufs: Vec<Buf> = slots[..n_args].iter().zip(arg_ns).map(|(&s, &n)| read_bytes(&self.buffers[s], self.plan.slots[s].0, n)).collect();
+                    bufs.extend(slots[n_args..].iter().map(|&s| Buf::zeros(self.plan.slots[s].0, self.plan.slots[s].1)));
                     exec_instr(instr, &mut bufs);
-                    write_bytes(&self.buffers[slots[last]], &bufs[last]);
+                    for (k, &s) in slots[n_args..].iter().enumerate() {
+                        write_bytes(&self.buffers[s], &bufs[n_args + k]);
+                    }
                     cpu += t0.elapsed().as_secs_f64();
                 }
             }

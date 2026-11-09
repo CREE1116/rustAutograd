@@ -65,6 +65,15 @@ impl Buf {
             _ => panic!("dtype mismatch"),
         }
     }
+    /// Copies `n` elements between positions. Panics on dtype mismatch (plans are type-checked).
+    pub fn copy_range_from(&mut self, at: usize, src: &Buf, from: usize, n: usize) {
+        match (self, src) {
+            (Buf::F32(d), Buf::F32(s)) => d[at..at + n].copy_from_slice(&s[from..from + n]),
+            (Buf::F64(d), Buf::F64(s)) => d[at..at + n].copy_from_slice(&s[from..from + n]),
+            (Buf::I32(d), Buf::I32(s)) => d[at..at + n].copy_from_slice(&s[from..from + n]),
+            _ => panic!("dtype mismatch"),
+        }
+    }
     pub fn prefix(&self, n: usize) -> Buf {
         match self {
             Buf::F32(v) => Buf::F32(v[..n].to_vec()),

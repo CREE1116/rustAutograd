@@ -17,6 +17,8 @@ _MAX_HEADER = 100 * 1024 * 1024
 def _encode(d):
     if d is None:
         return None
+    if d[0] == "none":
+        return ["none"]
     if d[0] == "dict":
         return ["dict", list(d[1]), [_encode(s) for s in d[2]]]
     return [d[0], [_encode(s) for s in d[1]]]
@@ -25,6 +27,8 @@ def _encode(d):
 def _decode(d):
     if d is None:
         return None
+    if d[0] == "none":
+        return ("none",)
     if d[0] == "dict":
         return ("dict", tuple(d[1]), tuple(_decode(s) for s in d[2]))
     return (d[0], tuple(_decode(s) for s in d[1]))
@@ -91,7 +95,7 @@ def load(path, with_metadata=False):
         values[name] = Tensor(_rg.Tensor(body[start:end], list(shape), _DTYPES[code]))
     if "rg_tree" in meta:
         tdef = _decode(json.loads(meta["rg_tree"]))
-        names = [n or "value" for n, _ in paths(_unflatten(tdef, [None] * len(values)))] if values else []
+        names = [n or "value" for n, _ in paths(_unflatten(tdef, [0] * len(values)))] if values else []
         if set(names) != set(values):
             raise ValueError(f"{path}: tree metadata does not match the stored tensors")
         result = _unflatten(tdef, [values[n] for n in names])

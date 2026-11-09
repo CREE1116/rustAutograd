@@ -131,10 +131,26 @@ fn classify(i: &Instr, args: &[Stats], out: &Stats) -> (&'static str, &'static s
 
 struct NonFinite<'a> {
     g: &'a Graph,
+    /// Control-flow bodies being executed, innermost last.
+    scopes: Vec<(std::sync::Arc<crate::graph::Body>, usize)>,
     roots: Vec<Diag>,
     propagated: usize,
     /// Findings that are wrong regardless of whether the outputs stay finite.
     hard: Vec<Diag>,
+}
+
+impl NonFinite<'_> {
+    /// Node description in the current scope, with where in the control flow it ran.
+    fn node_json(&self, id: u32) -> Value {
+        match self.scopes.last() {
+            None => self.g.node_json(id),
+            Some((body, iteration)) => {
+                let mut v = body.graph.node_json(id);
+                v["control_flow"] = json!({ "iteration": iteration, "depth": self.scopes.len() });
+                v
+            }
+        }
+    }
 }
 
 fn index_check(o: &mut NonFinite, i: &Instr, slots: &[Buf]) {
@@ -147,7 +163,8 @@ fn index_check(o: &mut NonFinite, i: &Instr, slots: &[Buf]) {
     let s = stats(&slots[i.args[1]], n);
     if n > 0 && (s.min < 0.0 || s.max >= dim as f64) && o.hard.len() < MAX_ROOTS {
         let obs = json!({ "index_min": s.min, "index_max": s.max, "axis_size": dim, "behavior_at_runtime": "clamped" });
-        o.hard.push(diag("INDEX_OUT_OF_RANGE", "error", o.g.node_json(i.node), obs, "index_outside_axis", "verified"));
+        let node = o.node_json(i.node);
+        o.hard.push(diag("INDEX_OUT_OF_RANGE", "error", node, obs, "index_outside_axis", "verified"));
     }
 }
 
@@ -195,7 +212,20 @@ impl Observer for NonFinite<'_> {
                 obs["overflow_threshold"] = num(limit);
             }
         }
-        self.roots.push(diag(code, "error", self.g.node_json(i.node), obs, cause, certainty));
+        let node = self.node_json(i.node);
+        self.roots.push(diag(code, "error", node, obs, cause, certainty));
+    }
+    fn enter_body(&mut self, body: &std::sync::Arc<crate::graph::Body>, iteration: usize) {
+        self.scopes.push((body.clone(), iteration));
+    }
+    fn leave_body(&mut self) {
+        self.scopes.pop();
+    }
+    fn while_limit(&mut self, i: &Instr) {
+        if let Op::While { max_iterations, .. } = i.op {
+            let node = self.node_json(i.node);
+            self.hard.push(diag("WHILE_LIMIT_REACHED", "error", node, json!({ "max_iterations": max_iterations }), "condition_stayed_true_past_the_limit", "verified"));
+        }
     }
 }
 
@@ -419,7 +449,7 @@ impl Compiled {
     /// Instrumented run of the unoptimized graph, so node ids and sources match the trace.
     /// Returns the outputs plus the gradient values, in `raw_plan` output order.
     fn observed(&self, inputs: &[Tensor]) -> (Vec<Diag>, Vec<Diag>, usize, Vec<Tensor>) {
-        let mut o = NonFinite { g: &self.raw, roots: vec![], propagated: 0, hard: vec![] };
+        let mut o = NonFinite { g: &self.raw, scopes: vec![], roots: vec![], propagated: 0, hard: vec![] };
         let keep = self.raw.reachable(&self.raw_outputs());
         for (id, n) in self.raw.nodes.iter().enumerate() {
             let t = match &n.op {

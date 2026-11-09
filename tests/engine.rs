@@ -1081,3 +1081,275 @@ fn recycled_cpu_frames_give_identical_runs() {
     let other = c.run(&spec, &[t(&[], &[1.5])], &[vec![t(&[], &[1.0]), t(&[], &[1.0])]], 5);
     assert_ne!(other.state, first.state);
 }
+
+// Control flow.
+
+fn input_ids(g: &Graph) -> Vec<u32> {
+    let mut ids = vec![0; g.n_inputs];
+    for (i, n) in g.nodes.iter().enumerate() {
+        if let Op::Input(k) = n.op {
+            ids[k] = i as u32;
+        }
+    }
+    ids
+}
+
+/// carry = tanh(carry * w + x); y = carry * carry, the shape of a small RNN.
+fn rnn_body(d: usize) -> (Graph, Vec<u32>) {
+    let mut b = Graph::new();
+    let (c, x, w) = (b.input(&[d], F), b.input(&[d], F), b.input(&[d], F));
+    let m = bin(&mut b, Op::Mul, c, w);
+    let a = bin(&mut b, Op::Add, m, x);
+    let next = un(&mut b, Op::Tanh, a);
+    let y = bin(&mut b, Op::Mul, next, next);
+    (b, vec![next, y])
+}
+
+fn rnn_scan(g: &mut Graph, c0: u32, xs: u32, w: u32, d: usize, len: usize) -> (u32, u32) {
+    let (b, outs) = rnn_body(d);
+    let body = rg::graph::Body::new(b, outs);
+    let node = g.add(Op::Scan { body, n_carry: 1, n_x: 1, length: len, reverse: false }, &[c0, xs, w]).unwrap();
+    let last = g.add(Op::Output { index: 0, shape: vec![d], dtype: F }, &[node]).unwrap();
+    let ys = g.add(Op::Output { index: 1, shape: vec![len, d], dtype: F }, &[node]).unwrap();
+    (last, ys)
+}
+
+fn rnn_unrolled(g: &mut Graph, c0: u32, xs: u32, w: u32, d: usize, len: usize) -> (u32, u32) {
+    let mut c = c0;
+    let mut ys = vec![];
+    for k in 0..len {
+        let s = un(g, Op::Slice { starts: vec![k, 0], stops: vec![k + 1, d] }, xs);
+        let x = un(g, Op::Reshape(vec![d]), s);
+        let m = bin(g, Op::Mul, c, w);
+        let a = bin(g, Op::Add, m, x);
+        c = un(g, Op::Tanh, a);
+        let y = bin(g, Op::Mul, c, c);
+        ys.push(un(g, Op::Reshape(vec![1, d]), y));
+    }
+    let stacked = g.add(Op::Concat { axis: 0 }, &ys).unwrap();
+    (c, stacked)
+}
+
+#[test]
+fn scan_values_and_gradients_equal_the_unrolled_loop() {
+    let (d, len) = (3, 5);
+    let inputs = [t(&[3], &[0.1, -0.2, 0.3]), t(&[5, 3], &(0..15).map(|i| (i as f64 * 0.7).sin()).collect::<Vec<_>>()), t(&[3], &[0.5, 0.9, -0.4])];
+    let args: Vec<&Tensor> = inputs.iter().collect();
+    let build = |use_scan: bool| {
+        let mut g = Graph::new();
+        let (c0, xs, w) = (g.input(&[3], F), g.input(&[5, 3], F), g.input(&[3], F));
+        let (last, ys) = if use_scan { rnn_scan(&mut g, c0, xs, w, d, len) } else { rnn_unrolled(&mut g, c0, xs, w, d, len) };
+        let s1 = sum_all(&mut g, last);
+        let s2 = sum_all(&mut g, ys);
+        let y = bin(&mut g, Op::Add, s1, s2);
+        let gs = grad(&mut g, y, &[c0, xs, w]).unwrap();
+        let mut outs = vec![last, ys, y];
+        outs.extend(gs);
+        (g, outs)
+    };
+    let ((a, oa), (b, ob)) = (build(true), build(false));
+    let (ra, rb) = (eval(&a, &oa, &args), eval(&b, &ob, &args));
+    for k in 0..oa.len() {
+        assert_eq!(ra[k].shape, rb[k].shape);
+        for (x, y) in vals(&ra[k]).iter().zip(&vals(&rb[k])) {
+            assert!((x - y).abs() < 1e-12, "output {k}: {x} vs {y}");
+        }
+    }
+    // The same through the optimized plan and every validation level.
+    let (o, ids, _) = optimize(&a, &oa);
+    let fast = run_plan(&Plan::build_fused(&o, &ids, Fuse::DEFAULT), &args, oa.len());
+    for k in 0..oa.len() {
+        for (x, y) in vals(&fast[k]).iter().zip(&vals(&rb[k])) {
+            assert!((x - y).abs() < 1e-12, "fast output {k}: {x} vs {y}");
+        }
+    }
+    let c = compile(a, oa, &inputs, Level::Thorough).unwrap();
+    assert_eq!(c.report["status"], "ok", "{}", c.report);
+    assert!(c.report["checks"][4]["detail"]["elements_checked"].as_u64().unwrap() > 5);
+}
+
+#[test]
+fn second_order_gradient_through_scan() {
+    // Repeated squaring: x -> x^(2^3), with d/dx and d2/dx2 known in closed form.
+    let mut b = Graph::new();
+    let c = b.input(&[], F);
+    let sq = bin(&mut b, Op::Mul, c, c);
+    let body = rg::graph::Body::new(b, vec![sq]);
+    let mut g = Graph::new();
+    let x = g.input(&[], F);
+    let node = g.add(Op::Scan { body, n_carry: 1, n_x: 0, length: 3, reverse: false }, &[x]).unwrap();
+    let y = g.add(Op::Output { index: 0, shape: vec![], dtype: F }, &[node]).unwrap();
+    let d1 = grad(&mut g, y, &[x]).unwrap()[0];
+    let d2 = grad(&mut g, d1, &[x]).unwrap()[0];
+    let r = eval(&g, &[y, d1, d2], &[&t(&[], &[1.5])]);
+    let v = 1.5f64;
+    assert!((vals(&r[0])[0] - v.powi(8)).abs() < 1e-9);
+    assert!((vals(&r[1])[0] - 8.0 * v.powi(7)).abs() < 1e-9);
+    assert!((vals(&r[2])[0] - 56.0 * v.powi(6)).abs() < 1e-8);
+}
+
+#[test]
+fn integer_carries_flow_through_scan_and_gradients() {
+    // The key-like int carry must not break differentiation of the float one.
+    let mut b = Graph::new();
+    let (i, x) = (b.input(&[], DType::I32), b.input(&[], F));
+    let one = b.constant(ints(&[], &[1]));
+    let ni = b.add(Op::Add, &[i, one]).unwrap();
+    let two = b.scalar(F, 2.0);
+    let nx = bin(&mut b, Op::Mul, x, two);
+    let body = rg::graph::Body::new(b, vec![ni, nx]);
+    let mut g = Graph::new();
+    let (i0, x0) = (g.constant(ints(&[], &[0])), g.input(&[], F));
+    let node = g.add(Op::Scan { body, n_carry: 2, n_x: 0, length: 4, reverse: false }, &[i0, x0]).unwrap();
+    let count = g.add(Op::Output { index: 0, shape: vec![], dtype: DType::I32 }, &[node]).unwrap();
+    let y = g.add(Op::Output { index: 1, shape: vec![], dtype: F }, &[node]).unwrap();
+    let gx = grad(&mut g, y, &[x0]).unwrap()[0];
+    let r = eval(&g, &[count, y, gx], &[&t(&[], &[3.0])]);
+    assert_eq!(vals(&r[0]), [4.0]);
+    assert_eq!(vals(&r[1]), [48.0]);
+    assert_eq!(vals(&r[2]), [16.0]);
+}
+
+fn counting_while(limit: f64, max_iterations: usize) -> (Graph, u32, u32) {
+    let mut cg = Graph::new();
+    let (i, _s) = (cg.input(&[], F), cg.input(&[], F));
+    let l = cg.scalar(F, limit);
+    let c = bin(&mut cg, Op::Gt, l, i);
+    let cond = rg::graph::Body::new(cg, vec![c]);
+    let mut bg = Graph::new();
+    let (i, s) = (bg.input(&[], F), bg.input(&[], F));
+    let one = bg.scalar(F, 1.0);
+    let ni = bin(&mut bg, Op::Add, i, one);
+    let ns = bin(&mut bg, Op::Add, s, i);
+    let body = rg::graph::Body::new(bg, vec![ni, ns]);
+    let mut g = Graph::new();
+    let (i0, s0) = (g.input(&[], F), g.input(&[], F));
+    let node = g.add(Op::While { cond, body, n_carry: 2, max_iterations }, &[i0, s0]).unwrap();
+    let last = g.add(Op::Output { index: 1, shape: vec![], dtype: F }, &[node]).unwrap();
+    let count = g.add(Op::Output { index: 2, shape: vec![], dtype: DType::I32 }, &[node]).unwrap();
+    (g, last, count)
+}
+
+#[test]
+fn while_loop_runs_to_its_condition_and_reports_the_limit() {
+    let z = t(&[], &[0.0]);
+    let (g, sum, count) = counting_while(10.0, 1000);
+    let r = eval(&g, &[sum, count], &[&z, &z]);
+    assert_eq!(vals(&r[0]), [45.0]);
+    assert_eq!(vals(&r[1]), [10.0]);
+    assert_eq!(compile(g, vec![sum], &[z.clone(), z.clone()], Level::Standard).unwrap().report["status"], "ok");
+
+    let (g, sum, count) = counting_while(1e9, 7);
+    assert_eq!(vals(&eval(&g, &[count], &[&z, &z])[0]), [7.0]);
+    let c = compile(g, vec![sum], &[z.clone(), z], Level::Standard).unwrap();
+    assert_eq!(c.report["status"], "validation_failed");
+    assert_eq!(c.report["diagnostics"][0]["code"], "WHILE_LIMIT_REACHED");
+
+    let (mut g, sum, _) = counting_while(5.0, 100);
+    let x = input_ids(&g)[0];
+    assert_eq!(grad(&mut g, sum, &[x]).unwrap_err()["code"], "GRAD_THROUGH_WHILE");
+}
+
+fn branch(f: impl Fn(&mut Graph, u32) -> u32) -> std::sync::Arc<rg::graph::Body> {
+    let mut b = Graph::new();
+    let x = b.input(&[], F);
+    let o = f(&mut b, x);
+    rg::graph::Body::new(b, vec![o])
+}
+
+#[test]
+fn cond_runs_only_the_taken_branch_and_differentiates_it() {
+    let build = || {
+        let then_body = branch(|b, x| un(b, Op::Log, x));
+        let else_body = branch(|b, x| bin(b, Op::Mul, x, x));
+        let mut g = Graph::new();
+        let (p, x) = (g.input(&[], F), g.input(&[], F));
+        let node = g.add(Op::Cond { then_body, else_body }, &[p, x]).unwrap();
+        let y = g.add(Op::Output { index: 0, shape: vec![], dtype: F }, &[node]).unwrap();
+        let gx = grad(&mut g, y, &[x]).unwrap()[0];
+        (g, y, gx)
+    };
+    let (g, y, gx) = build();
+    let (yes, no, x) = (t(&[], &[1.0]), t(&[], &[0.0]), t(&[], &[2.0]));
+    let r = eval(&g, &[y, gx], &[&yes, &x]);
+    assert!((vals(&r[0])[0] - 2f64.ln()).abs() < 1e-12);
+    assert!((vals(&r[1])[0] - 0.5).abs() < 1e-12);
+    let r = eval(&g, &[y, gx], &[&no, &x]);
+    assert_eq!(vals(&r[0]), [4.0]);
+    assert_eq!(vals(&r[1]), [4.0]);
+
+    // log(-1) sits in the branch not taken: no NaN, no diagnostic, unlike `where`.
+    let (g, y, _) = build();
+    let negative = t(&[], &[-1.0]);
+    let c = compile(g, vec![y], &[no.clone(), negative.clone()], Level::Standard).unwrap();
+    assert_eq!(c.report["status"], "ok", "{}", c.report);
+    // Taken, it is found inside the branch.
+    let bad = c.check(&[yes, negative]);
+    assert_eq!(bad["status"], "validation_failed");
+    assert_eq!(bad["diagnostics"][0]["node"]["operation"], "log");
+    assert_eq!(bad["diagnostics"][0]["node"]["control_flow"]["iteration"], 0);
+}
+
+#[test]
+fn diagnostics_name_the_iteration_inside_a_scan() {
+    // x doubles each step until exp overflows float32.
+    let mut b = Graph::new();
+    let c = b.input(&[], DType::F32);
+    let e = un(&mut b, Op::Exp, c);
+    let two = b.scalar(DType::F32, 2.0);
+    let next = bin(&mut b, Op::Mul, c, two);
+    let body = rg::graph::Body::new(b, vec![next, e]);
+    let mut g = Graph::new();
+    let x = g.input(&[], DType::F32);
+    let node = g.add(Op::Scan { body, n_carry: 1, n_x: 0, length: 12, reverse: false }, &[x]).unwrap();
+    let ys = g.add(Op::Output { index: 1, shape: vec![12], dtype: DType::F32 }, &[node]).unwrap();
+    let c = compile(g, vec![ys], &[Tensor::from_f64(DType::F32, &[], &[1.0])], Level::Standard).unwrap();
+    let d = &c.report["diagnostics"][0];
+    assert_eq!(c.report["status"], "validation_failed");
+    assert_eq!(d["code"], "NUMERIC_OVERFLOW");
+    assert_eq!(d["node"]["operation"], "exp");
+    // 2^7 = 128 is the first value past float32's exp limit of about 88.7.
+    assert_eq!(d["node"]["control_flow"]["iteration"], 7);
+}
+
+#[test]
+fn arg_top_k_orders_ties_and_nan_deterministically() {
+    let mut g = Graph::new();
+    let x = g.input(&[2, 5], F);
+    let k2 = un(&mut g, Op::ArgTopK { k: 2 }, x);
+    let k5 = un(&mut g, Op::ArgTopK { k: 5 }, x);
+    let input = t(&[2, 5], &[1.0, 3.0, 2.0, 3.0, 0.0, f64::NAN, -1.0, f64::NAN, 4.0, 2.0]);
+    let r = eval(&g, &[k2, k5], &[&input]);
+    assert_eq!(r[0], ints(&[2, 2], &[1, 3, 3, 4]));
+    assert_eq!(r[1], ints(&[2, 5], &[1, 3, 2, 0, 4, 3, 4, 1, 0, 2]));
+    assert_eq!(g.add(Op::ArgTopK { k: 6 }, &[x]).unwrap_err()["code"], "INVALID_AXIS");
+}
+
+#[test]
+fn large_top_k_is_identical_serial_and_parallel() {
+    let n = 1 << 18;
+    let v: Vec<f64> = (0..n).map(|i| ((i * 37 % 1000) as f64 * 0.73).sin().round()).collect();
+    let input = t(&[n / 64, 64], &v);
+    let mut g = Graph::new();
+    let x = g.input(&[n / 64, 64], F);
+    let k = un(&mut g, Op::ArgTopK { k: 9 }, x);
+    let serial = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| eval(&g, &[k], &[&input]));
+    assert_eq!(serial, eval(&g, &[k], &[&input]));
+}
+
+#[test]
+fn cumsum_and_its_gradient() {
+    let x0 = t(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+    let mut g = Graph::new();
+    let x = g.input(&[2, 3], F);
+    let c = un(&mut g, Op::Cumsum { reverse: false }, x);
+    let r = un(&mut g, Op::Cumsum { reverse: true }, x);
+    let w = g.constant(t(&[2, 3], &[1., 10., 100., 2., 20., 200.]));
+    let m = bin(&mut g, Op::Mul, c, w);
+    let y = sum_all(&mut g, m);
+    let gx = grad(&mut g, y, &[x]).unwrap()[0];
+    let out = eval(&g, &[c, r, gx], &[&x0]);
+    assert_eq!(vals(&out[0]), [1., 3., 6., 4., 9., 15.]);
+    assert_eq!(vals(&out[1]), [6., 5., 3., 15., 11., 6.]);
+    assert_eq!(vals(&out[2]), [111., 110., 100., 222., 220., 200.]);
+}

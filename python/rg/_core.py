@@ -10,6 +10,7 @@ from ._rg import DiagnosticError
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 _traces = []  # stack of graphs being traced
+_scopes = {}  # id(body graph) -> how its captures reach the enclosing graph
 _TYPECODES = {"float32": "f", "float64": "d", "int32": "i"}
 MEMORY_WARNING_FRACTION = 0.5
 
@@ -300,9 +301,16 @@ def _dtype_of(args):
 
 def _node(g, a, dtype):
     if isinstance(a, Tracer):
-        if a._g is not g:
+        if a._g is g:
+            return a._id
+        scope = _scopes.get(id(g))
+        if scope is None:
             raise _fail("TRACER_LEAK", {"node": a._id}, "tracer_from_a_finished_trace")
-        return a._id
+        # A control-flow body closing over an outer value: it becomes an extra body input.
+        outer = _node(scope.parent, a, dtype)
+        if outer not in scope.captures:
+            scope.captures[outer] = g.input(list(a.shape), a.dtype, _source())
+        return scope.captures[outer]
     if isinstance(a, float) and dtype == "int32" and not a.is_integer():
         raise _fail("DTYPE_MISMATCH", {"scalar": a, "tensor_dtype": dtype}, "fractional_scalar_with_int32_tensor_cast_first")
     t = a if isinstance(a, Tensor) else tensor(a, dtype if isinstance(a, (int, float)) else None)
@@ -322,6 +330,164 @@ def _op(name, *args, **attrs):
     g = _rg.Graph()
     ids = [_node(g, a, dtype) for a in args]
     return Tensor(g.eval([g.op(name, ids, attrs or None, src)])[0])
+
+
+class _Scope:
+    def __init__(self, parent, captures=None):
+        self.parent = parent
+        self.captures = dict(captures or {})
+
+
+def _trace_body(fn, specs, unflatten_args, seed_captures=None):
+    """Traces `fn` into a new graph with `specs` as its first inputs. Returns (graph, out, scope)."""
+    body = _rg.Graph()
+    src = _source()
+    inputs = [Tracer(body, body.input(list(s), d, src)) for s, d in specs]
+    scope = _Scope(_traces[-1])
+    for outer, (shape, dtype) in (seed_captures or {}).items():
+        scope.captures[outer] = body.input(list(shape), dtype, src)
+    _scopes[id(body)] = scope
+    _traces.append(body)
+    try:
+        out = fn(*unflatten_args(inputs))
+        out_leaves, out_def = _flatten(out)
+        ids = [_node(body, l, _dtype_of(out_leaves) or "float32") for l in out_leaves]
+    finally:
+        _traces.pop()
+        del _scopes[id(body)]
+    return body, ids, out_def, scope
+
+
+def _signature(graph, ids):
+    return [(tuple(graph.shape(i)), graph.dtype(i)) for i in ids]
+
+
+def _mismatch(what, want, got):
+    return _fail("CONTROL_FLOW_SHAPE_MISMATCH", {"part": what, "expected": repr(want), "actual": repr(got)}, f"{what}_must_keep_its_structure_shape_and_dtype")
+
+
+def _lift_tree(tree, g):
+    leaves, tdef = _flatten(tree)
+    dtype = _dtype_of(leaves) or "float32"
+    return [Tracer(g, _node(g, l, dtype)) for l in leaves], tdef
+
+
+def scan(f, init, xs=None, length=None):
+    """Loops `carry, y = f(carry, x)` over the first axis of `xs`, in one graph node.
+
+    Returns `(final carry, stacked ys)`. Differentiable. `xs=None` needs `length`, and `f` gets
+    `None` as `x`. For a few steps a plain Python loop does the same and is often simpler; `scan`
+    keeps the graph small when the loop is long.
+    """
+    if not _traces:
+        if xs is None:
+            return _eager_or(lambda i: scan(f, i, None, length))(init)
+        return _eager_or(lambda i, x: scan(f, i, x, length))(init, xs)
+    g = _traces[-1]
+    src = _source()
+    carry, c_def = _lift_tree(init, g)
+    x_leaves, x_def = _lift_tree(xs, g) if xs is not None else ([], None)
+    lengths = {t.shape[0] if t.ndim else None for t in x_leaves}
+    if length is not None:
+        lengths.add(length)
+    if len(lengths) != 1 or None in lengths:
+        raise _fail("CONTROL_FLOW_SHAPE_MISMATCH", {"part": "xs", "lengths": repr(sorted(map(str, lengths)))}, "xs_need_one_shared_first_axis_or_an_explicit_length")
+    n = lengths.pop()
+
+    def unpack(inputs):
+        c = _unflatten(c_def, inputs[:len(carry)])
+        x = _unflatten(x_def, inputs[len(carry):]) if xs is not None else None
+        return c, x
+
+    specs = [(t.shape, t.dtype) for t in carry] + [(t.shape[1:], t.dtype) for t in x_leaves]
+
+    def body_fn(c, x):
+        out = f(c, x)
+        if not (isinstance(out, tuple) and len(out) == 2):
+            raise _fail("CONTROL_FLOW_SHAPE_MISMATCH", {"part": "body", "returned": type(out).__name__}, "scan_body_must_return_carry_and_y")
+        next_c, y = out
+        return (next_c, () if y is None else y)
+
+    body, ids, out_def, scope = _trace_body(body_fn, specs, unpack)
+    want_c = (None if c_def is None else c_def)
+    if out_def[1][0] != want_c:
+        raise _mismatch("carry", want_c, out_def[1][0])
+    got = _signature(body, ids[:len(carry)])
+    want = [(t.shape, t.dtype) for t in carry]
+    if got != want:
+        raise _mismatch("carry", want, got)
+    inputs = [t._id for t in carry] + [t._id for t in x_leaves] + list(scope.captures)
+    node = g.scan(body, ids, len(carry), len(x_leaves), n, inputs, src)
+    final = [Tracer(g, g.output(node, k, list(t.shape), t.dtype)) for k, t in enumerate(carry)]
+    stacked = []
+    for k, (shape, dtype) in enumerate(_signature(body, ids[len(carry):])):
+        stacked.append(Tracer(g, g.output(node, len(carry) + k, [n] + list(shape), dtype)))
+    return _unflatten(c_def, final), (None if out_def[1][1] == ("tuple", ()) else _unflatten(out_def[1][1], stacked))
+
+
+def while_loop(cond_fn, body_fn, init, max_iterations=100000):
+    """Repeats `state = body_fn(state)` while `cond_fn(state)` is nonzero. Not differentiable.
+
+    Validation reports `WHILE_LIMIT_REACHED` if the limit stops the loop; `run` does not check,
+    and returns the state reached at the limit.
+    """
+    if not _traces:
+        return _eager_or(lambda i: while_loop(cond_fn, body_fn, i, max_iterations))(init)
+    g = _traces[-1]
+    src = _source()
+    carry, c_def = _lift_tree(init, g)
+    specs = [(t.shape, t.dtype) for t in carry]
+    unpack = lambda inputs: (_unflatten(c_def, inputs[:len(carry)]),)
+    cond_g, cond_ids, _, c_scope = _trace_body(cond_fn, specs, unpack)
+    if len(cond_ids) != 1 or cond_g.shape(cond_ids[0]) not in ([], [1]):
+        raise _fail("CONTROL_FLOW_SHAPE_MISMATCH", {"part": "condition", "outputs": [cond_g.shape(i) for i in cond_ids]}, "condition_must_be_a_scalar")
+    seen = {o: (tuple(_shape_of(g, o)), g.dtype(o)) for o in c_scope.captures}
+    body, ids, out_def, b_scope = _trace_body(body_fn, specs, unpack, seen)
+    if out_def != c_def:
+        raise _mismatch("state", c_def, out_def)
+    got = _signature(body, ids)
+    if got != specs:
+        raise _mismatch("state", specs, got)
+    # The body may have captured more; the condition gets the same inputs, unused.
+    for outer in b_scope.captures:
+        if outer not in c_scope.captures:
+            cond_g.input(_shape_of(g, outer), g.dtype(outer), src)
+    inputs = [t._id for t in carry] + list(b_scope.captures)
+    node = g.while_loop(cond_g, cond_ids[0], body, ids, len(carry), max_iterations, inputs, src)
+    return _unflatten(c_def, [Tracer(g, g.output(node, k, list(t.shape), t.dtype)) for k, t in enumerate(carry)])
+
+
+def _shape_of(g, node):
+    return g.shape(node)
+
+
+def cond(pred, then_fn, else_fn, *args):
+    """Runs only the chosen branch, unlike `where`, which computes both. Differentiable.
+
+    Both branches take `*args` and must return the same structure, shapes and dtypes.
+    """
+    if not _traces:
+        return _eager_or(lambda p, *a: cond(p, then_fn, else_fn, *a))(pred, *args)
+    g = _traces[-1]
+    src = _source()
+    leaves, tdef = _lift_tree(args, g)
+    pid = _node(g, pred, _dtype_of([pred]) or "float32")
+    specs = [(t.shape, t.dtype) for t in leaves]
+    unpack = lambda inputs: _unflatten(tdef, inputs)
+    then_g, then_ids, then_def, t_scope = _trace_body(then_fn, specs, unpack)
+    seen = {o: (tuple(_shape_of(g, o)), g.dtype(o)) for o in t_scope.captures}
+    else_g, else_ids, else_def, e_scope = _trace_body(else_fn, specs, unpack, seen)
+    if then_def != else_def:
+        raise _mismatch("branches", then_def, else_def)
+    want, got = _signature(then_g, then_ids), _signature(else_g, else_ids)
+    if want != got:
+        raise _mismatch("branches", want, got)
+    for outer in e_scope.captures:
+        if outer not in t_scope.captures:
+            then_g.input(_shape_of(g, outer), g.dtype(outer), src)
+    inputs = [pid] + [t._id for t in leaves] + list(e_scope.captures)
+    node = g.cond(then_g, then_ids, else_g, else_ids, inputs, src)
+    return _unflatten(then_def, [Tracer(g, g.output(node, k, list(s), d)) for k, (s, d) in enumerate(want)])
 
 
 def stop_gradient(x): return _op("stop_gradient", x)
@@ -401,6 +567,34 @@ def squeeze(x, axis=None):
     return x.reshape([d for i, d in enumerate(x.shape) if i not in drop])
 
 
+def _on_last(x, axis, fn):
+    axis = _axis(x, axis)
+    if axis == x.ndim - 1:
+        return fn(x)
+    return swapaxes(fn(swapaxes(x, axis, -1)), axis, -1)
+
+
+def top_k(x, k, axis=-1):
+    """The `k` largest values and their int32 indices, descending. Ties keep index order; NaN ranks last."""
+    idx = _on_last(x, axis, lambda v: _op("arg_top_k", v, k=k))
+    return take_along_axis(x, idx, axis), idx
+
+
+def argsort(x, axis=-1, descending=False):
+    """Indices that sort `x`. Stable, with NaN last in both directions."""
+    n = x.shape[_axis(x, axis)]
+    return _on_last(x if descending else -x, axis, lambda v: _op("arg_top_k", v, k=n))
+
+
+def sort(x, axis=-1, descending=False):
+    """Sorted values. Differentiable: gradients follow each value to its original position."""
+    return take_along_axis(x, argsort(x, axis, descending), axis)
+
+
+def cumsum(x, axis=-1):
+    return _on_last(x, axis, lambda v: _op("cumsum", v, reverse=False))
+
+
 def argmax(x, axis=-1):
     """Index of the largest value on `axis`, as int32; `axis=None` flattens first."""
     if axis is None:
@@ -448,7 +642,10 @@ def tril(n, dtype="float32"):
 
 
 def _flatten(tree):
-    """Returns (leaves, treedef). Tuples, lists and dicts are containers; anything else is a leaf."""
+    """Returns (leaves, treedef). Tuples, lists and dicts are containers, None holds nothing, and
+    anything else is a leaf."""
+    if tree is None:
+        return [], ("none",)
     if isinstance(tree, (tuple, list)):
         parts = [_flatten(x) for x in tree]
         return [l for p in parts for l in p[0]], (type(tree).__name__, tuple(p[1] for p in parts))
@@ -465,6 +662,8 @@ def _unflatten(tdef, leaves):
     def build(d):
         if d is None:
             return next(it)
+        if d[0] == "none":
+            return None
         if d[0] == "dict":
             return {k: build(s) for k, s in zip(d[1], d[2])}
         items = [build(s) for s in d[1]]
@@ -476,6 +675,8 @@ def _paths(tdef, prefix):
     """Leaf names in flatten order: `aux`, `aux.loss`, `aux.0`."""
     if tdef is None:
         return [prefix]
+    if tdef[0] == "none":
+        return []
     if tdef[0] == "dict":
         return [p for k, s in zip(tdef[1], tdef[2]) for p in _paths(s, f"{prefix}.{k}")]
     return [p for i, s in enumerate(tdef[1]) for p in _paths(s, f"{prefix}.{i}")]

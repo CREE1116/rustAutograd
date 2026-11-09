@@ -9,8 +9,8 @@ import math
 
 from . import random
 from ._core import (
-    abs, argmax, concatenate, equal, exp, eye, maximum, ones, stop_gradient, swapaxes, take,
-    take_along_axis, tanh, where, zeros,
+    abs, argmax, argsort, concatenate, cumsum, equal, exp, eye, maximum, ones, sort, stop_gradient,
+    swapaxes, take, take_along_axis, tanh, top_k, where, zeros,
 )
 
 # Activations
@@ -52,6 +52,24 @@ def dropout(key, x, rate, training=True):
         return x
     keep = 1.0 - rate
     return x * random.bernoulli(key, keep, x.shape, x.dtype) / keep
+
+
+# Sampling filters: logits with what should not be sampled pushed to a very low value.
+
+
+def top_k_logits(logits, k):
+    """Keeps the `k` largest logits on the last axis."""
+    values, _ = top_k(logits, k)
+    return where(logits >= values[..., -1:], logits, -1e9)
+
+
+def top_p_logits(logits, p):
+    """Nucleus filter: keeps the smallest set of top tokens whose probability reaches `p`."""
+    order = argsort(logits, descending=True)
+    probs = softmax(take_along_axis(logits, order))
+    # A token stays while the mass before it is below p, so the top token always stays.
+    keep_sorted = (cumsum(probs) - probs) < p
+    return where(take_along_axis(keep_sorted, argsort(order.cast(logits.dtype))), logits, -1e9)
 
 
 # Losses and metrics

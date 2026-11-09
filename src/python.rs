@@ -123,6 +123,8 @@ fn parse_op(name: &str, a: Option<&Bound<'_, PyDict>>) -> PyResult<Op> {
         "take_along" => TakeAlong,
         "concat" => Concat { axis: attr(a, "axis")? },
         "argmax" => Argmax,
+        "arg_top_k" => ArgTopK { k: attr(a, "k")? },
+        "cumsum" => Cumsum { reverse: attr(a, "reverse")? },
         "random_uniform" => RandUniform { shape: attr(a, "shape")?, dtype: parse_dtype(&attr::<String>(a, "dtype")?)? },
         "random_normal" => RandNormal { shape: attr(a, "shape")?, dtype: parse_dtype(&attr::<String>(a, "dtype")?)? },
         "key_split" => KeySplit { n: attr(a, "n")? },
@@ -153,6 +155,28 @@ impl PyGraph {
     fn grad(&mut self, py: Python<'_>, y: u32, wrts: Vec<u32>, source: Option<&str>) -> PyResult<Vec<u32>> {
         self.g.cur_source = source.map(Arc::from);
         autodiff::grad(&mut self.g, y, &wrts).map_err(|d| raise(py, d))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn scan(&mut self, py: Python<'_>, body: &PyGraph, outputs: Vec<u32>, n_carry: usize, n_x: usize, length: usize, inputs: Vec<u32>, source: Option<&str>) -> PyResult<u32> {
+        self.g.cur_source = source.map(Arc::from);
+        let body = crate::graph::Body::new(body.g.clone(), outputs);
+        self.g.add(Op::Scan { body, n_carry, n_x, length, reverse: false }, &inputs).map_err(|d| raise(py, d))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn while_loop(&mut self, py: Python<'_>, cond: &PyGraph, cond_output: u32, body: &PyGraph, outputs: Vec<u32>, n_carry: usize, max_iterations: usize, inputs: Vec<u32>, source: Option<&str>) -> PyResult<u32> {
+        self.g.cur_source = source.map(Arc::from);
+        let (cond, body) = (crate::graph::Body::new(cond.g.clone(), vec![cond_output]), crate::graph::Body::new(body.g.clone(), outputs));
+        self.g.add(Op::While { cond, body, n_carry, max_iterations }, &inputs).map_err(|d| raise(py, d))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn cond(&mut self, py: Python<'_>, then_body: &PyGraph, then_outputs: Vec<u32>, else_body: &PyGraph, else_outputs: Vec<u32>, inputs: Vec<u32>, source: Option<&str>) -> PyResult<u32> {
+        self.g.cur_source = source.map(Arc::from);
+        let (then_body, else_body) = (crate::graph::Body::new(then_body.g.clone(), then_outputs), crate::graph::Body::new(else_body.g.clone(), else_outputs));
+        self.g.add(Op::Cond { then_body, else_body }, &inputs).map_err(|d| raise(py, d))
+    }
+    fn output(&mut self, node: u32, index: usize, shape: Vec<usize>, dtype: &str) -> PyResult<u32> {
+        let dtype = parse_dtype(dtype)?;
+        self.g.add(Op::Output { index, shape, dtype }, &[node]).map_err(|_| PyValueError::new_err("invalid control-flow output"))
     }
     fn placeholder(&mut self, shape: Vec<usize>, dtype: &str) -> PyResult<u32> {
         Ok(self.g.placeholder(&shape, parse_dtype(dtype)?))

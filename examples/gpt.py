@@ -68,12 +68,16 @@ def make_train_step(model, opt, batch):
     return step
 
 
-def compile_sampler(model, params, temperature=1.0):
+def compile_sampler(model, params, temperature=1.0, top_k=None, top_p=None):
     """A compiled step that appends one token: `run` then generates with no Python per token."""
 
     def step(state):
         k1, k2 = random.split(state["key"])
         logits = model(params, state["ctx"])[:, -1, :] / temperature
+        if top_k:
+            logits = nn.top_k_logits(logits, top_k)
+        if top_p:
+            logits = nn.top_p_logits(logits, top_p)
         token = random.categorical(k2, logits)
         ctx = rg.concatenate([state["ctx"][:, 1:], token[:, None]], axis=1)
         return {"ctx": ctx, "key": k1}, token[0]
@@ -116,6 +120,8 @@ def main():
     a.add_argument("--prompt", default="The ")
     a.add_argument("--tokens", type=int, default=400)
     a.add_argument("--temperature", type=float, default=0.8)
+    a.add_argument("--top-k", type=int)
+    a.add_argument("--top-p", type=float)
     args = a.parse_args()
 
     if args.load:
@@ -164,7 +170,7 @@ def main():
         rg.save(args.out, params, metadata={"config": json.dumps(cfg), "vocab": json.dumps(chars)})
         print(f"saved {args.out}")
 
-    sampler = compile_sampler(eval_model, params, args.temperature)
+    sampler = compile_sampler(eval_model, params, args.temperature, args.top_k, args.top_p)
     prompt = [to_id[c] for c in args.prompt if c in to_id] or [0]
     t0 = time.perf_counter()
     tokens = generate(sampler, cfg["block"], prompt, args.tokens, args.seed)

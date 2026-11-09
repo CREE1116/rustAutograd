@@ -26,8 +26,6 @@ PyTorch의 `detect_anomaly`, JAX의 `debug_nans`도 NaN을 찾아 주지만, 위
 
 | 기능 | 영향 | 현재 대안 |
 | --- | --- | --- |
-| **그래프 내 제어 흐름** (`scan`, `while_loop`) | 값에 따라 길이가 달라지는 루프를 표현할 수 없음 | 고정 횟수는 Python 루프로 펼치기, 분기는 `rg.where` |
-| **sort, top-k** | 정렬에 의존하는 수학을 효율적으로 표현할 수 없음 | numpy로 후처리 |
 | **CUDA** | NVIDIA 환경에서 CPU로만 동작 | Apple GPU는 `device="metal"` |
 | **동적 shape** | 입력 크기마다 재컴파일 | 고정 길이로 패딩 |
 | **슬라이스 step, 대입** | 일부 코드가 길어짐 | `take`, `concatenate` |

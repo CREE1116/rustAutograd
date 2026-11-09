@@ -1,4 +1,4 @@
-use crate::graph::{diag, Diag, GradRecord, Graph, Op, ReduceKind};
+use crate::graph::{diag, Body, Diag, GradRecord, Graph, Op, ReduceKind};
 use crate::tensor::{DType, Tensor};
 use std::collections::HashMap;
 use serde_json::json;
@@ -16,7 +16,222 @@ fn unbroadcast(g: &mut Graph, ct: u32, target: &[usize]) -> Result<u32, Diag> {
 }
 
 fn blocks_gradient(op: &Op) -> bool {
-    matches!(op, Op::StopGradient | Op::Sign | Op::Gt | Op::Ge | Op::Floor | Op::Argmax | Op::RandUniform { .. } | Op::RandNormal { .. } | Op::KeySplit { .. } | Op::Placeholder)
+    matches!(op, Op::StopGradient | Op::Sign | Op::Gt | Op::Ge | Op::Floor | Op::Argmax | Op::RandUniform { .. } | Op::RandNormal { .. } | Op::KeySplit { .. } | Op::Placeholder | Op::ArgTopK { .. })
+}
+
+/// The body's gradient as a graph: original inputs, then one cotangent per float output; outputs
+/// are one gradient per float input. Uses `sum(output * cotangent)` so `grad` applies as usual.
+struct Vjp {
+    graph: Graph,
+    /// Gradient node of each float input, in the order of `float_in`.
+    grads: Vec<u32>,
+    float_in: Vec<usize>,
+    float_out: Vec<usize>,
+}
+
+fn vjp_graph(body: &Body) -> Result<Vjp, Diag> {
+    let mut g = body.graph.clone();
+    g.grads.clear();
+    g.notes.clear();
+    let n_in = g.n_inputs;
+    let mut inputs = vec![0u32; n_in];
+    for (id, n) in g.nodes.iter().enumerate() {
+        if let Op::Input(k) = n.op {
+            inputs[k] = id as u32;
+        }
+    }
+    let float_in: Vec<usize> = (0..n_in).filter(|&k| g.dtype(inputs[k]) != DType::I32).collect();
+    let float_out: Vec<usize> = (0..body.outputs.len()).filter(|&k| body.output_dtype(k) != DType::I32).collect();
+    let d = float_in.first().map(|&k| g.dtype(inputs[k])).unwrap_or(DType::F32);
+    let mut total = g.scalar(d, 0.0);
+    for &k in &float_out {
+        let o = body.outputs[k];
+        let ct = g.input(&body.output_shape(k).to_vec(), body.output_dtype(k));
+        let m = g.add(Op::Mul, &[o, ct])?;
+        let axes = (0..g.shape(m).len()).collect();
+        let sum = g.add(Op::Reduce { kind: ReduceKind::Sum, axes, keepdims: false }, &[m])?;
+        let sum = if g.dtype(sum) == d { sum } else { g.add(Op::Cast(d), &[sum])? };
+        total = g.add(Op::Add, &[total, sum])?;
+    }
+    let wrts: Vec<u32> = float_in.iter().map(|&k| inputs[k]).collect();
+    let grads = grad(&mut g, total, &wrts)?;
+    g.notes.clear();
+    g.grads.clear();
+    Ok(Vjp { graph: g, grads, float_in, float_out })
+}
+
+fn zeros_for(g: &mut Graph, shape: &[usize], d: DType) -> u32 {
+    g.constant(Tensor::full(d, shape, 0.0))
+}
+
+/// Reverse rule of control flow. `cots[k]` is the cotangent of output `k`, if it reached one.
+fn vjp_control(g: &mut Graph, i: usize, cots: &HashMap<usize, u32>, rel: &[bool]) -> Result<Vec<(u32, u32)>, Diag> {
+    let node = g.nodes[i].clone();
+    match &node.op {
+        Op::While { .. } => {
+            let obs = json!({ "alternative": "rg.scan with a fixed length" });
+            Err(diag("GRAD_THROUGH_WHILE", "error", g.node_json(i as u32), obs, "iteration_count_is_a_runtime_value", "verified"))
+        }
+        Op::Cond { then_body, else_body } => {
+            let (t, e) = (vjp_graph(then_body)?, vjp_graph(else_body)?);
+            let (float_in, float_out) = (t.float_in, t.float_out);
+            let (tb, eb) = (Body::new(t.graph, t.grads), Body::new(e.graph, e.grads));
+            let mut ins = node.inputs.clone();
+            for &k in &float_out {
+                let (s, d) = (then_body.output_shape(k).to_vec(), then_body.output_dtype(k));
+                ins.push(match cots.get(&k) {
+                    Some(&c) => c,
+                    None => zeros_for(g, &s, d),
+                });
+            }
+            let cond = g.add(Op::Cond { then_body: tb, else_body: eb }, &ins)?;
+            let mut out = vec![];
+            for (j, &k) in float_in.iter().enumerate() {
+                let target = node.inputs[k + 1];
+                if rel[target as usize] {
+                    let (s, d) = (g.shape(target).to_vec(), g.dtype(target));
+                    let o = g.add(Op::Output { index: j, shape: s, dtype: d }, &[cond])?;
+                    out.push((target, o));
+                }
+            }
+            Ok(out)
+        }
+        Op::Scan { body, n_carry, n_x, length, reverse } => {
+            let (c, x, len) = (*n_carry, *n_x, *length);
+            let m = body.graph.n_inputs - c - x;
+            let n_y = body.outputs.len() - c;
+            let Vjp { graph: mut r, grads, float_in, float_out } = vjp_graph(body)?;
+            let fc: Vec<usize> = float_out.iter().copied().filter(|&k| k < c).collect();
+            let fy: Vec<usize> = float_out.iter().copied().filter(|&k| k >= c).collect();
+            let g_x: Vec<usize> = (0..float_in.len()).filter(|&j| (c..c + x).contains(&float_in[j])).collect();
+            let g_cap: Vec<usize> = (0..float_in.len()).filter(|&j| float_in[j] >= c + x).collect();
+            // A float carry's gradient must exist for every float carry output, so they line up.
+            let (n_ct, n_acc) = (fc.len(), g_cap.len());
+            // Renumber the VJP's inputs into the reverse scan's layout:
+            // carries (cotangents, accumulated capture gradients); xs (saved carries, xs, y
+            // cotangents); captures.
+            // Saved carries are outputs too. Second-order gradients send cotangents to them, which
+            // join each carry's gradient at the matching step.
+            let hist: Vec<usize> = if fc.iter().any(|k| cots.contains_key(&(c + n_y + k))) { fc.clone() } else { vec![] };
+            let n_orig = c + x + m;
+            let renumber = |k: usize| -> usize {
+                if k < c {
+                    n_ct + n_acc + k
+                } else if k < c + x {
+                    n_ct + n_acc + c + (k - c)
+                } else if k < n_orig {
+                    n_ct + n_acc + c + x + fy.len() + hist.len() + (k - c - x)
+                } else if k - n_orig < n_ct {
+                    k - n_orig
+                } else {
+                    n_ct + n_acc + c + x + (k - n_orig - n_ct)
+                }
+            };
+            for n in &mut r.nodes {
+                if let Op::Input(k) = &mut n.op {
+                    *k = renumber(*k);
+                }
+            }
+            let mut acc_inputs = vec![];
+            for (a, &j) in g_cap.iter().enumerate() {
+                let id = grads[j];
+                let (s, d) = (r.shape(id).to_vec(), r.dtype(id));
+                r.nodes.push(crate::graph::Node { op: Op::Input(n_ct + a), inputs: vec![], shape: s, dtype: d, source: None, origin: None });
+                acc_inputs.push((r.nodes.len() - 1) as u32);
+                r.n_inputs += 1;
+            }
+            let mut outs = vec![];
+            for &k in &fc {
+                let j = float_in.iter().position(|&q| q == k).expect("float carry outputs have float inputs");
+                let mut gradient = grads[j];
+                if let Some(a) = hist.iter().position(|&q| q == k) {
+                    let (sh, d) = (r.shape(gradient).to_vec(), r.dtype(gradient));
+                    r.nodes.push(crate::graph::Node { op: Op::Input(n_ct + n_acc + c + x + fy.len() + a), inputs: vec![], shape: sh, dtype: d, source: None, origin: None });
+                    r.n_inputs += 1;
+                    let saved = (r.nodes.len() - 1) as u32;
+                    gradient = r.add(Op::Add, &[gradient, saved])?;
+                }
+                outs.push(gradient);
+            }
+            for (a, &j) in g_cap.iter().enumerate() {
+                outs.push(r.add(Op::Add, &[acc_inputs[a], grads[j]])?);
+            }
+            for &j in &g_x {
+                outs.push(grads[j]);
+            }
+            let reverse_body = Body::new(r, outs);
+
+            let mut ins = vec![];
+            for &k in &fc {
+                let (s, d) = (body.output_shape(k).to_vec(), body.output_dtype(k));
+                ins.push(match cots.get(&k) {
+                    Some(&ct) => ct,
+                    None => zeros_for(g, &s, d),
+                });
+            }
+            for &j in &g_cap {
+                let target = node.inputs[float_in[j]];
+                let (s, d) = (g.shape(target).to_vec(), g.dtype(target));
+                ins.push(zeros_for(g, &s, d));
+            }
+            for k in 0..c {
+                let mut s = vec![len];
+                s.extend_from_slice(body.graph.shape(body_input(body, k)));
+                let d = body.graph.dtype(body_input(body, k));
+                ins.push(g.add(Op::Output { index: c + n_y + k, shape: s, dtype: d }, &[i as u32])?);
+            }
+            ins.extend_from_slice(&node.inputs[c..c + x]);
+            for &k in &fy {
+                let mut s = vec![len];
+                s.extend_from_slice(body.output_shape(k));
+                let d = body.output_dtype(k);
+                ins.push(match cots.get(&k) {
+                    Some(&ct) => ct,
+                    None => zeros_for(g, &s, d),
+                });
+            }
+            for &k in &hist {
+                let mut s = vec![len];
+                s.extend_from_slice(body.graph.shape(body_input(body, k)));
+                let d = body.graph.dtype(body_input(body, k));
+                ins.push(match cots.get(&(c + n_y + k)) {
+                    Some(&ct) => ct,
+                    None => zeros_for(g, &s, d),
+                });
+            }
+            ins.extend_from_slice(&node.inputs[c + x..]);
+            let back = g.add(Op::Scan { body: reverse_body, n_carry: n_ct + n_acc, n_x: c + x + fy.len() + hist.len(), length: len, reverse: !*reverse }, &ins)?;
+
+            let mut out = vec![];
+            for (a, &k) in fc.iter().enumerate() {
+                let target = node.inputs[k];
+                if rel[target as usize] {
+                    let (s, d) = (g.shape(target).to_vec(), g.dtype(target));
+                    out.push((target, g.add(Op::Output { index: a, shape: s, dtype: d }, &[back])?));
+                }
+            }
+            for (a, &j) in g_cap.iter().enumerate() {
+                let target = node.inputs[float_in[j]];
+                if rel[target as usize] {
+                    let (s, d) = (g.shape(target).to_vec(), g.dtype(target));
+                    out.push((target, g.add(Op::Output { index: n_ct + a, shape: s, dtype: d }, &[back])?));
+                }
+            }
+            for (a, &j) in g_x.iter().enumerate() {
+                let target = node.inputs[float_in[j]];
+                if rel[target as usize] {
+                    let (s, d) = (g.shape(target).to_vec(), g.dtype(target));
+                    out.push((target, g.add(Op::Output { index: n_ct + n_acc + a, shape: s, dtype: d }, &[back])?));
+                }
+            }
+            Ok(out)
+        }
+        other => unreachable!("{} is not control flow", other.name()),
+    }
+}
+
+fn body_input(body: &Body, k: usize) -> u32 {
+    body.graph.nodes.iter().position(|n| matches!(n.op, Op::Input(q) if q == k)).expect("every input exists") as u32
 }
 
 /// Transposes the last two axes.
@@ -46,6 +261,7 @@ pub fn grad(g: &mut Graph, y: u32, wrts: &[u32]) -> Result<Vec<u32>, Diag> {
         let flows = match &n.op {
             // The rule, not the traced body, defines how gradients reach the inputs.
             Op::Custom { rules, .. } => rules.iter().any(|&(t, _)| rel[t as usize]),
+            op if op.is_control_flow() => n.inputs.iter().any(|&x| rel[x as usize]),
             op => !blocks_gradient(op) && n.inputs.iter().any(|&x| rel[x as usize]),
         };
         rel[i] = n.dtype != DType::I32 && (wrts.contains(&(i as u32)) || flows);
@@ -56,6 +272,30 @@ pub fn grad(g: &mut Graph, y: u32, wrts: &[u32]) -> Result<Vec<u32>, Diag> {
         cot[end] = Some(g.constant(Tensor::full(g.dtype(y), &g.shape(y).to_vec(), 1.0)));
     }
     for i in (0..=end).rev() {
+        if g.nodes[i].op.is_control_flow() {
+            if !rel[i] {
+                continue;
+            }
+            // Every output node comes later in the graph, so its cotangent is already complete.
+            let mut cots = HashMap::new();
+            for (o, n) in g.nodes.iter().enumerate().take(end + 1).skip(i + 1) {
+                if let (Op::Output { index, .. }, true, Some(c)) = (&n.op, n.inputs.first() == Some(&(i as u32)), cot[o]) {
+                    cots.insert(*index, c);
+                }
+            }
+            if cots.is_empty() {
+                continue;
+            }
+            g.cur_source = g.nodes[i].source.clone();
+            g.cur_origin = Some(i as u32);
+            for (input, c) in vjp_control(g, i, &cots, &rel)? {
+                cot[input as usize] = Some(match cot[input as usize] {
+                    Some(prev) => g.add(Op::Add, &[prev, c])?,
+                    None => c,
+                });
+            }
+            continue;
+        }
         let Some(ct) = cot[i] else { continue };
         g.cur_source = g.nodes[i].source.clone();
         g.cur_origin = Some(i as u32);
@@ -261,7 +501,9 @@ fn vjp(g: &mut Graph, i: usize, ct: u32, rel: &[bool]) -> Result<Vec<(u32, u32)>
                 }
             }
         }
-        Floor | Argmax | RandUniform { .. } | RandNormal { .. } | KeySplit { .. } | Placeholder => {}
+        Floor | Argmax | RandUniform { .. } | RandNormal { .. } | KeySplit { .. } | Placeholder | ArgTopK { .. } | Output { .. } => {}
+        Cumsum { reverse } => out.push((x, g.add(Cumsum { reverse: !*reverse }, &[ct])?)),
+        Scan { .. } | While { .. } | Cond { .. } => unreachable!("handled before the rule table"),
         Reduce { kind, axes, .. } => {
             let in_shape = g.shape(x).to_vec();
             let mut keep = in_shape.clone();

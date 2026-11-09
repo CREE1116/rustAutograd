@@ -1,9 +1,41 @@
+use crate::plan::Plan;
 use crate::tensor::{DType, Tensor};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Diagnostics are plain JSON: the machine-readable form is the only form.
 pub type Diag = Value;
+
+/// A traced sub-function: the unit of control flow. `fast` runs normally; `reference` keeps every
+/// value and the traced node ids, for diagnostics.
+pub struct Body {
+    pub graph: Graph,
+    pub outputs: Vec<u32>,
+    pub fast: Plan,
+    pub reference: Plan,
+}
+
+impl std::fmt::Debug for Body {
+    /// Identity, not content: this also keys common-subexpression elimination.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Body@{:p}", self)
+    }
+}
+
+impl Body {
+    pub fn new(graph: Graph, outputs: Vec<u32>) -> Arc<Body> {
+        let (opt, ids, _) = crate::optimize::optimize(&graph, &outputs);
+        let fast = Plan::build_fused(&opt, &ids, crate::plan::Fuse::DEFAULT);
+        let reference = Plan::build(&graph, &outputs, false);
+        Arc::new(Body { graph, outputs, fast, reference })
+    }
+    pub fn output_dtype(&self, k: usize) -> DType {
+        self.graph.dtype(self.outputs[k])
+    }
+    pub fn output_shape(&self, k: usize) -> &[usize] {
+        self.graph.shape(self.outputs[k])
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReduceKind {
@@ -61,6 +93,20 @@ pub enum Op {
     RandUniform { shape: Vec<usize>, dtype: DType },
     RandNormal { shape: Vec<usize>, dtype: DType },
     KeySplit { n: usize },
+    /// Indices of the `k` largest on the last axis, in descending order. Ties keep index order
+    /// and NaN ranks last, so results are deterministic.
+    ArgTopK { k: usize },
+    /// Running sum on the last axis, from the far end when `reverse`.
+    Cumsum { reverse: bool },
+    /// `(carry, y) = body(carry, x, captures)` over the first axis of each x. Inputs are carries,
+    /// xs, captures. Outputs by index: final carries, stacked ys, stacked carries before each step.
+    Scan { body: Arc<Body>, n_carry: usize, n_x: usize, length: usize, reverse: bool },
+    /// Inputs are carries, captures. Outputs by index: final carries, then the iteration count.
+    While { cond: Arc<Body>, body: Arc<Body>, n_carry: usize, max_iterations: usize },
+    /// Runs one branch only. Inputs are the predicate, then the arguments of both branches.
+    Cond { then_body: Arc<Body>, else_body: Arc<Body> },
+    /// One output of a control-flow node.
+    Output { index: usize, shape: Vec<usize>, dtype: DType },
     /// Stands for the cotangent inside a custom VJP rule; never executed.
     Placeholder,
     /// Identity on input 0, differentiated by the rule instead of through it.
@@ -114,6 +160,12 @@ impl Op {
             RandUniform { .. } => "random_uniform",
             RandNormal { .. } => "random_normal",
             KeySplit { .. } => "key_split",
+            ArgTopK { .. } => "arg_top_k",
+            Cumsum { .. } => "cumsum",
+            Scan { .. } => "scan",
+            While { .. } => "while_loop",
+            Cond { .. } => "cond",
+            Output { .. } => "output",
             Placeholder => "placeholder",
             Custom { .. } => "custom_vjp",
         }
@@ -122,10 +174,13 @@ impl Op {
         use Op::*;
         matches!(self, Neg | Exp | Log | Sqrt | Sin | Cos | Tanh | Abs | Sign | Floor)
     }
+    pub fn is_control_flow(&self) -> bool {
+        matches!(self, Op::Scan { .. } | Op::While { .. } | Op::Cond { .. })
+    }
     /// Ops defined on int32. Everything else is float-only.
     pub fn int_ok(&self) -> bool {
         use Op::*;
-        matches!(self, Add | Sub | Mul | Gt | Ge | Where | Reshape(_) | Transpose(_) | BroadcastTo(_) | Slice { .. } | Concat { .. } | Take { .. } | TakeAlong | Cast(_) | StopGradient)
+        matches!(self, Add | Sub | Mul | Gt | Ge | Where | Reshape(_) | Transpose(_) | BroadcastTo(_) | Slice { .. } | Concat { .. } | Take { .. } | TakeAlong | Cast(_) | StopGradient | Cumsum { .. })
     }
     pub fn is_binary_elementwise(&self) -> bool {
         use Op::*;
@@ -134,7 +189,7 @@ impl Op {
     /// Piecewise ops make finite differences unreliable at kinks, so mismatches stay `suspected`.
     pub fn is_nonsmooth(&self) -> bool {
         use Op::*;
-        matches!(self, Abs | Sign | Floor | Max | Min | Gt | Ge | Where | Custom { .. } | Reduce { kind: ReduceKind::Max | ReduceKind::Min, .. })
+        matches!(self, Abs | Sign | Floor | Max | Min | Gt | Ge | Where | Custom { .. } | ArgTopK { .. } | Cond { .. } | Reduce { kind: ReduceKind::Max | ReduceKind::Min, .. })
     }
 }
 
@@ -270,11 +325,20 @@ impl Graph {
             Where => 3,
             MatMul | MatMulT { .. } | Take { .. } | TakeAlong | TakeGrad { .. } | TakeAlongGrad { .. } => 2,
             Concat { .. } => inputs.len().max(1),
+            o if o.is_control_flow() => inputs.len(),
             o if o.is_binary_elementwise() => 2,
             _ => 1,
         };
         if inputs.len() != arity {
             return Err(self.static_err("ARITY_MISMATCH", &op, json!({ "expected": arity, "actual": inputs.len() }), "wrong_input_count"));
+        }
+        if op.is_control_flow() {
+            self.check_control_flow(&op, inputs)?;
+            return Ok(self.push(op, inputs.to_vec(), vec![], DType::F32));
+        }
+        if let Output { shape, dtype, .. } = &op {
+            let (s, d) = (shape.clone(), *dtype);
+            return Ok(self.push(op, inputs.to_vec(), s, d));
         }
         let dtypes: Vec<DType> = inputs.iter().map(|&i| self.dtype(i)).collect();
         let indexes = matches!(op, Take { .. } | TakeAlong | TakeGrad { .. } | TakeAlongGrad { .. });
@@ -289,14 +353,14 @@ impl Graph {
             let names: Vec<_> = dtypes.iter().map(|d| d.name()).collect();
             return Err(self.static_err("DTYPE_MISMATCH", &op, json!({ "input_dtypes": names }), "implicit_promotion_not_allowed"));
         }
-        if !random && !matches!(op, Argmax) && dtypes[0] == DType::I32 && !op.int_ok() {
+        if !random && !matches!(op, Argmax | ArgTopK { .. }) && dtypes[0] == DType::I32 && !op.int_ok() {
             return Err(self.static_err("UNSUPPORTED_DTYPE", &op, json!({ "dtype": "int32" }), "operation_is_float_only_cast_first"));
         }
         let dtype = match &op {
             Cast(d) => *d,
             RandUniform { dtype, .. } | RandNormal { dtype, .. } => *dtype,
             KeySplit { .. } => DType::I32,
-            Argmax => DType::I32,
+            Argmax | ArgTopK { .. } => DType::I32,
             _ => dtypes[0],
         };
         let shapes: Vec<Vec<usize>> = inputs.iter().map(|&i| self.nodes[i as usize].shape.clone()).collect();
@@ -381,6 +445,21 @@ impl Graph {
                 out[*axis] = s.iter().map(|t| t[*axis]).sum();
                 Ok(out)
             }
+            ArgTopK { k } => {
+                let v = s[0].last().copied().unwrap_or(0);
+                if *k == 0 || *k > v {
+                    return Err(self.static_err("INVALID_AXIS", op, json!({ "shape": s[0], "k": k }), "k_must_be_between_one_and_the_last_axis_size"));
+                }
+                let mut out = s[0].clone();
+                *out.last_mut().expect("v > 0 implies rank > 0") = *k;
+                Ok(out)
+            }
+            Cumsum { .. } => {
+                if s[0].is_empty() {
+                    return Err(self.static_err("INVALID_AXIS", op, json!({ "shape": s[0] }), "cumsum_needs_at_least_one_axis"));
+                }
+                Ok(s[0].clone())
+            }
             Argmax => {
                 if s[0].is_empty() || s[0][s[0].len() - 1] == 0 {
                     return Err(self.static_err("INVALID_AXIS", op, json!({ "shape": s[0] }), "argmax_needs_a_nonempty_last_axis"));
@@ -442,6 +521,42 @@ impl Graph {
         }
     }
 
+    /// Inputs must match what the body was traced with; a mismatch here is an engine bug or a
+    /// direct IR user, since the Python frontend checks structure first.
+    fn check_control_flow(&self, op: &Op, inputs: &[u32]) -> Result<(), Diag> {
+        let expect = |body: &Body, args: &[u32], n_stacked: std::ops::Range<usize>, length: usize| -> Result<(), Diag> {
+            let shapes: Vec<(Vec<usize>, DType)> = body.graph.nodes.iter().filter_map(|n| if let Op::Input(k) = n.op { Some((k, n.shape.clone(), n.dtype)) } else { None }).fold(vec![(vec![], DType::F32); body.graph.n_inputs], |mut acc, (k, s, d)| {
+                acc[k] = (s, d);
+                acc
+            });
+            let ok = shapes.len() == args.len()
+                && shapes.iter().zip(args).enumerate().all(|(k, ((s, d), &a))| {
+                    let have = self.shape(a);
+                    let elem = if n_stacked.contains(&k) { have.first() == Some(&length) && &have[1..] == s.as_slice() } else { have == s.as_slice() };
+                    elem && self.dtype(a) == *d
+                });
+            if ok {
+                Ok(())
+            } else {
+                let have: Vec<_> = args.iter().map(|&a| self.shape(a).to_vec()).collect();
+                let want: Vec<_> = shapes.iter().map(|(s, _)| s.clone()).collect();
+                Err(self.static_err("CONTROL_FLOW_SHAPE_MISMATCH", op, json!({ "body_inputs": want, "given_inputs": have }), "inputs_differ_from_the_traced_body"))
+            }
+        };
+        match op {
+            Op::Scan { body, n_carry, n_x, length, .. } => expect(body, inputs, *n_carry..*n_carry + *n_x, *length),
+            Op::While { cond, body, .. } => {
+                expect(cond, inputs, 0..0, 0)?;
+                expect(body, inputs, 0..0, 0)
+            }
+            Op::Cond { then_body, else_body } => {
+                expect(then_body, &inputs[1..], 0..0, 0)?;
+                expect(else_body, &inputs[1..], 0..0, 0)
+            }
+            _ => unreachable!("only control flow is checked here"),
+        }
+    }
+
     /// Nodes needed to compute `outputs`, as a mask over node ids.
     pub fn reachable(&self, outputs: &[u32]) -> Vec<bool> {
         let mut keep = vec![false; self.nodes.len()];
@@ -462,6 +577,20 @@ impl Graph {
     pub fn to_f64(&self) -> Graph {
         let mut g = self.clone();
         for n in &mut g.nodes {
+            let widen = |b: &Arc<Body>| Body::new(b.graph.to_f64(), b.outputs.clone());
+            match &mut n.op {
+                Op::Scan { body, .. } => *body = widen(body),
+                Op::While { cond, body, .. } => {
+                    *cond = widen(cond);
+                    *body = widen(body);
+                }
+                Op::Cond { then_body, else_body } => {
+                    *then_body = widen(then_body);
+                    *else_body = widen(else_body);
+                }
+                Op::Output { dtype, .. } if *dtype != DType::I32 => *dtype = DType::F64,
+                _ => {}
+            }
             if n.dtype == DType::I32 {
                 continue;
             }
