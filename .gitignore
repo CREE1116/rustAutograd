@@ -1,0 +1,11 @@
+/target
+/.venv
+/site
+__pycache__/
+*.pyc
+*.so
+*.dylib
+*.safetensors
+.pytest_cache/
+/dist
+/wheels

@@ -1,0 +1,113 @@
+{
+  "tiny   (B=16, T=32,  d=64,  H=2, L=2)": {
+    "rg cpu": {
+      "steps_per_s": 361.59971787507874,
+      "setup_seconds": 0.006417249998776242,
+      "last_loss": 4.855587005615234
+    },
+    "rg metal": {
+      "steps_per_s": 557.6810691675564,
+      "setup_seconds": 0.30027274999883957,
+      "last_loss": 4.855587959289551
+    },
+    "mlx": {
+      "steps_per_s": 389.6084922014657,
+      "setup_seconds": 0.0183614999987185,
+      "last_loss": 4.85968017578125
+    },
+    "torch mps": {
+      "steps_per_s": 237.00212128308402,
+      "setup_seconds": 1.9440969999996014,
+      "last_loss": 4.865039348602295
+    },
+    "torch eager": {
+      "steps_per_s": 192.13290432081396,
+      "setup_seconds": 1.6128363749885466,
+      "last_loss": 4.865039348602295
+    },
+    "torch.compile": {
+      "steps_per_s": 208.9081935392019,
+      "setup_seconds": 1.042972916009603,
+      "last_loss": 4.865038871765137
+    },
+    "jax jit": {
+      "steps_per_s": 427.84307458031526,
+      "setup_seconds": 0.3669609169883188,
+      "last_loss": 4.852969169616699
+    }
+  },
+  "small  (B=32, T=64,  d=128, H=4, L=4)": {
+    "rg cpu": {
+      "steps_per_s": 31.455376379195975,
+      "setup_seconds": 0.04405624998616986,
+      "last_loss": 4.858436584472656
+    },
+    "rg metal": {
+      "steps_per_s": 85.61773636649548,
+      "setup_seconds": 0.09932324997498654,
+      "last_loss": 4.858440399169922
+    },
+    "mlx": {
+      "steps_per_s": 88.40309756521093,
+      "setup_seconds": 0.03036475001135841,
+      "last_loss": 4.8561811447143555
+    },
+    "torch mps": {
+      "steps_per_s": 65.44824751096344,
+      "setup_seconds": 1.793920625001192,
+      "last_loss": 4.858090877532959
+    },
+    "torch eager": {
+      "steps_per_s": 32.46760493993816,
+      "setup_seconds": 1.648985999985598,
+      "last_loss": 4.858091354370117
+    },
+    "torch.compile": {
+      "steps_per_s": 43.523935360797324,
+      "setup_seconds": 0.7625077499833424,
+      "last_loss": 4.858089447021484
+    },
+    "jax jit": {
+      "steps_per_s": 41.33841916570351,
+      "setup_seconds": 0.4937254170072265,
+      "last_loss": 4.855619430541992
+    }
+  },
+  "medium (B=32, T=128, d=256, H=8, L=6)": {
+    "rg cpu": {
+      "steps_per_s": 5.88934509500986,
+      "setup_seconds": 0.22207004099618644,
+      "last_loss": 4.858211517333984
+    },
+    "rg metal": {
+      "steps_per_s": 13.832840396991823,
+      "setup_seconds": 0.2519881250045728,
+      "last_loss": 4.85821533203125
+    },
+    "mlx": {
+      "steps_per_s": 12.500226787861408,
+      "setup_seconds": 0.10009120899485424,
+      "last_loss": 4.8650593757629395
+    },
+    "torch mps": {
+      "steps_per_s": 12.794833725954117,
+      "setup_seconds": 1.845273457991425,
+      "last_loss": 4.8585968017578125
+    },
+    "torch eager": {
+      "steps_per_s": 6.879292705428455,
+      "setup_seconds": 1.8130269999965094,
+      "last_loss": 4.858596324920654
+    },
+    "torch.compile": {
+      "steps_per_s": 6.995818977930989,
+      "setup_seconds": 0.9409661249956116,
+      "last_loss": 4.8585968017578125
+    },
+    "jax jit": {
+      "steps_per_s": 5.393796999401129,
+      "setup_seconds": 0.778289624984609,
+      "last_loss": 4.860649108886719
+    }
+  }
+}

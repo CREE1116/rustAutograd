@@ -1,0 +1,38 @@
+site_name: rg
+site_description: Rust 기반 자동미분·텐서 컴파일 프레임워크
+docs_dir: docs
+strict: true
+theme:
+  name: material
+  language: ko
+  features:
+    - navigation.sections
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: { icon: material/weather-night, name: 다크 모드 }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: { icon: material/weather-sunny, name: 라이트 모드 }
+markdown_extensions:
+  - admonition
+  - tables
+  - toc: { permalink: true }
+  - pymdownx.highlight
+  - pymdownx.superfences
+nav:
+  - 소개: index.md
+  - 시작하기:
+      - 설치: install.md
+      - 빠른 시작: quickstart.md
+  - 개념:
+      - 추적과 컴파일: concepts.md
+      - 진단 시스템: diagnostics.md
+  - 튜토리얼:
+      - 언어 모델 만들기: tutorial-gpt.md
+  - API 레퍼런스: api.md
+  - 프로젝트:
+      - 성능: performance.md
+      - 다른 프레임워크와 비교: comparison.md
+      - 내부 구조: internals.md

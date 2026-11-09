@@ -1,0 +1,56 @@
+{
+  "small  (d=16,  h=32,  n=64)": {
+    "rg": {
+      "steps_per_s": 187606.6265193176,
+      "final_loss": 0.00022066885139793158
+    },
+    "torch eager": {
+      "steps_per_s": 21019.62705813701,
+      "final_loss": 0.0002206693752668798
+    },
+    "torch.compile": {
+      "steps_per_s": 17250.24608570553,
+      "final_loss": 0.00022066938981879503
+    },
+    "jax jit": {
+      "steps_per_s": 94053.60762160919,
+      "final_loss": 0.00022066879319027066
+    }
+  },
+  "medium (d=64,  h=256, n=512)": {
+    "rg": {
+      "steps_per_s": 5085.3189384905245,
+      "final_loss": 0.09614650160074234
+    },
+    "torch eager": {
+      "steps_per_s": 3302.9125946490562,
+      "final_loss": 0.09614649415016174
+    },
+    "torch.compile": {
+      "steps_per_s": 2535.902836855614,
+      "final_loss": 0.09614649415016174
+    },
+    "jax jit": {
+      "steps_per_s": 6080.607575084428,
+      "final_loss": 0.09614649415016174
+    }
+  },
+  "large  (d=256, h=1024,n=2048)": {
+    "rg": {
+      "steps_per_s": 457.1822610288177,
+      "final_loss": 0.2939970791339874
+    },
+    "torch eager": {
+      "steps_per_s": 408.4195694424042,
+      "final_loss": 0.2939970791339874
+    },
+    "torch.compile": {
+      "steps_per_s": 395.99982363006274,
+      "final_loss": 0.29399701952934265
+    },
+    "jax jit": {
+      "steps_per_s": 418.2752290117494,
+      "final_loss": 0.2939971089363098
+    }
+  }
+}
