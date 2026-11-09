@@ -10,6 +10,9 @@ const CSE_CONST_LIMIT: usize = 16;
 /// Below this many elements a value is not worth recomputing to save memory.
 pub const REMAT_MIN: usize = 1 << 14;
 const SPLIT_SUM_MIN: usize = 4096;
+/// A rewrite must promise this cost ratio. Rewriting changes rounding, and small estimated gains
+/// are within the model's error, so below this the original program stays.
+const SEARCH_MIN_GAIN: f64 = 0.9;
 
 #[derive(Default, Clone, Debug)]
 pub struct OptStats {
@@ -19,6 +22,8 @@ pub struct OptStats {
     pub simplified: usize,
     pub cse: usize,
     pub rematerialized: usize,
+    /// Equality saturation, if it ran: whether its result was accepted, and its statistics.
+    pub search: Option<(bool, crate::egraph::SearchStats)>,
 }
 
 impl OptStats {
@@ -30,6 +35,7 @@ impl OptStats {
             "algebraic_simplified": self.simplified,
             "cse_merged": self.cse,
             "rematerialized": self.rematerialized,
+            "search": self.search.as_ref().map(|(accepted, s)| json!({ "accepted": accepted, "iterations": s.iterations, "egraph_nodes": s.egraph_nodes, "cost_before": s.cost_before, "cost_after": s.cost_after })),
         })
     }
 }
@@ -166,26 +172,120 @@ pub fn optimize(g: &Graph, outputs: &[u32]) -> (Graph, Vec<u32>, OptStats) {
 /// `metal`: a full sum of a large tensor would run on a single GPU thread, so it is split into a
 /// parallel sum along the last axis and a small sum of the results.
 pub fn optimize_for(g: &Graph, outputs: &[u32], metal: bool) -> (Graph, Vec<u32>, OptStats) {
-    let (ng, out, mut st, backward) = simplify(g, outputs, metal);
-    let (mut h, mut h_out) = rematerialize(&ng, &out, &backward, REMAT_MIN, false, &mut st);
+    optimize_mode(g, outputs, metal, Mode::Standard)
+}
+
+/// How hard the compiler looks for a better expression of the same math.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mode {
+    /// Only dead-code removal, to measure what optimization is worth.
+    None,
+    Standard,
+    /// Standard plus equality saturation with rules exact in IEEE 754.
+    SearchExact,
+    /// Exact rules plus matrix-product reassociation and factoring.
+    SearchLinear,
+    /// Also rules that change rounding, such as associativity. Compile validation still checks
+    /// the result against the original program.
+    Search,
+    /// Compiles `Standard` and `SearchLinear`, times both on the example inputs and keeps the
+    /// faster. Timing varies, so unlike the other modes this can pick differently between runs.
+    Auto,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s {
+            "none" => Some(Mode::None),
+            "standard" => Some(Mode::Standard),
+            "search-exact" => Some(Mode::SearchExact),
+            "search-linear" => Some(Mode::SearchLinear),
+            "search" => Some(Mode::Search),
+            "auto" => Some(Mode::Auto),
+            _ => None,
+        }
+    }
+}
+
+pub fn optimize_mode(g: &Graph, outputs: &[u32], metal: bool, mode: Mode) -> (Graph, Vec<u32>, OptStats) {
+    assert!(mode != Mode::Auto, "compile_mode resolves Auto into concrete modes");
+    if mode == Mode::None {
+        let keep = g.reachable(outputs).iter().filter(|&&k| k).count();
+        return (g.clone(), outputs.to_vec(), OptStats { nodes_before: keep, nodes_after: keep, ..Default::default() });
+    }
+    let (ng, out, mut st, backward) = match mode {
+        Mode::Search | Mode::SearchExact | Mode::SearchLinear => {
+            let baseline = simplify(g, outputs, metal, true);
+            let (first, first_out, _, _) = simplify(g, outputs, false, false);
+            if mode == Mode::SearchLinear && !has_matrix_structure(&first, &first_out) {
+                let (a, b, mut st, c) = baseline;
+                st.nodes_before = g.reachable(outputs).iter().filter(|&&k| k).count();
+                return finish(&a, &b, &c, st);
+            }
+            let model = if metal { crate::egraph::CostModel::METAL } else { crate::egraph::CostModel::CPU };
+            let set = match mode {
+                Mode::Search => crate::egraph::RuleSet::Rounding,
+                Mode::SearchLinear => crate::egraph::RuleSet::Linear,
+                _ => crate::egraph::RuleSet::Exact,
+            };
+            let (found, mut search) = crate::egraph::search(&first, &first_out, model, set, &crate::egraph::DEFAULT_LIMITS);
+            // Compare final forms: both sides have folded constants and flagged transposes.
+            search.cost_before = model.graph_cost(&baseline.0, &baseline.1);
+            let candidate = found.map(|(h, o)| simplify(&h, &o, metal, true));
+            let cost = candidate.as_ref().map(|c| model.graph_cost(&c.0, &c.1));
+            search.cost_after = cost.unwrap_or(search.cost_before);
+            let accepted = cost.is_some_and(|c| c < search.cost_before * SEARCH_MIN_GAIN);
+            let (a, b, mut st, c) = if accepted { candidate.expect("accepted implies a candidate") } else { baseline };
+            st.nodes_before = g.reachable(outputs).iter().filter(|&&k| k).count();
+            st.search = Some((accepted, search));
+            (a, b, st, c)
+        }
+        _ => simplify(g, outputs, metal, true),
+    };
+    finish(&ng, &out, &backward, st)
+}
+
+fn finish(ng: &Graph, out: &[u32], backward: &[bool], mut st: OptStats) -> (Graph, Vec<u32>, OptStats) {
+    let (mut h, mut h_out) = rematerialize(ng, out, backward, REMAT_MIN, false, &mut st);
     if Plan::build(&h, &h_out, true).peak_live_bytes > COSTLY_REMAT_ABOVE_BYTES {
         st.rematerialized = 0;
-        (h, h_out) = rematerialize(&ng, &out, &backward, REMAT_MIN, true, &mut st);
+        (h, h_out) = rematerialize(ng, out, backward, REMAT_MIN, true, &mut st);
     }
     st.nodes_after = h.reachable(&h_out).iter().filter(|&&k| k).count();
     (h, h_out, st)
 }
 
+/// Whether reassociating or factoring matrix products could apply at all. Without a product feeding
+/// a product, or a sum of products, the linear rules have nothing to do and the search is skipped.
+fn has_matrix_structure(g: &Graph, outputs: &[u32]) -> bool {
+    let keep = g.reachable(outputs);
+    let is_product = |id: u32| {
+        let mut n = &g.nodes[id as usize];
+        if matches!(&n.op, Op::Transpose(p) if p.as_slice() == [1, 0]) {
+            n = &g.nodes[n.inputs[0] as usize];
+        }
+        matches!(n.op, Op::MatMul)
+    };
+    g.nodes.iter().enumerate().any(|(i, n)| {
+        keep[i]
+            && match n.op {
+                Op::MatMul => n.inputs.iter().any(|&x| is_product(x)),
+                Op::Add => n.inputs.iter().all(|&x| is_product(x)),
+                _ => false,
+            }
+    })
+}
+
 /// `remat_min` is the smallest value recomputation applies to; tests lower it to reach every path.
 pub fn optimize_with(g: &Graph, outputs: &[u32], remat_min: usize) -> (Graph, Vec<u32>, OptStats) {
-    let (ng, out, mut st, backward) = simplify(g, outputs, false);
+    let (ng, out, mut st, backward) = simplify(g, outputs, false, true);
     let (h, out) = rematerialize(&ng, &out, &backward, remat_min, true, &mut st);
     st.nodes_after = h.reachable(&out).iter().filter(|&&k| k).count();
     (h, out, st)
 }
 
 /// Single forward rewrite: SSA order means folds and identities cascade without a fixpoint loop.
-fn simplify(g: &Graph, outputs: &[u32], metal: bool) -> (Graph, Vec<u32>, OptStats, Vec<bool>) {
+fn simplify(g: &Graph, outputs: &[u32], metal: bool, flip_transposes: bool) -> (Graph, Vec<u32>, OptStats, Vec<bool>) {
     let keep = g.reachable(outputs);
     let mut st = OptStats { nodes_before: keep.iter().filter(|&&k| k).count(), ..Default::default() };
     let mut ng = Graph::new();
@@ -236,7 +336,7 @@ fn simplify(g: &Graph, outputs: &[u32], metal: bool) -> (Graph, Vec<u32>, OptSta
         }
 
         // BLAS reads a transposed operand directly; the copy then goes away with DCE.
-        if matches!(op, Op::MatMul) {
+        if flip_transposes && matches!(op, Op::MatMul) {
             let flipped = |id: u32| match &ng.nodes[id as usize].op {
                 Op::Transpose(p) if p.len() >= 2 && p.iter().enumerate().all(|(i, &v)| if i + 2 < p.len() { i == v } else { i + v == 2 * p.len() - 3 }) => Some(ng.nodes[id as usize].inputs[0]),
                 _ => None,
@@ -288,7 +388,7 @@ fn simplify(g: &Graph, outputs: &[u32], metal: bool) -> (Graph, Vec<u32>, OptSta
             Op::Const(t) => ng.constant(Tensor::clone(&t)),
             op => ng.add(op, &ins).expect("node already passed shape inference"),
         };
-        ng.nodes[id as usize].origin = None;
+        ng.nodes[id as usize].origin = node.origin; // only presence is read after this point
         backward.resize(ng.nodes.len(), false);
         backward[id as usize] = node.origin.is_some();
         if let Some(k) = key {

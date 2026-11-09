@@ -466,11 +466,29 @@ impl Plan {
     /// The production plan: buffer reuse plus threaded elementwise groups, or GPU kernels.
     pub fn build_fused(g: &Graph, outputs: &[u32], cfg: Fuse) -> Plan {
         let plan = Plan::build_with(g, outputs, true, Some(cfg));
-        if cfg.metal && cfg.levels && plan.peak_live_bytes > LEVEL_ORDER_MAX_PEAK {
-            // Level order keeps values alive longer: 5 GB became 13 GB on a large model.
-            return Plan::build_with(g, outputs, true, Some(Fuse { levels: false, ..cfg }));
+        if !(cfg.metal && cfg.levels) {
+            return plan;
+        }
+        // Level order cuts barriers but writes more values, which keep living longer. Which wins
+        // depends on the program: a GPT gained 12%, a polynomial lost half its speed.
+        let greedy = Plan::build_with(g, outputs, true, Some(Fuse { levels: false, ..cfg }));
+        if plan.peak_live_bytes > LEVEL_ORDER_MAX_PEAK || greedy.gpu_cost_estimate() < plan.gpu_cost_estimate() {
+            return greedy;
         }
         plan
+    }
+
+    /// Estimated GPU nanoseconds per run: dispatches, plus memory traffic from values written.
+    pub fn gpu_cost_estimate(&self) -> f64 {
+        const PER_DISPATCH_NS: f64 = 30_000.0;
+        const PER_ELEMENT_NS: f64 = 0.1;
+        self.steps
+            .iter()
+            .map(|s| match s {
+                Step::One(i) => PER_DISPATCH_NS + PER_ELEMENT_NS * i.n as f64,
+                Step::Fused(f) => PER_DISPATCH_NS + PER_ELEMENT_NS * (f.n * f.outputs.len()) as f64,
+            })
+            .sum()
     }
 
     pub fn instrs(&self) -> Vec<&Instr> {

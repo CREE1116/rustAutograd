@@ -6,6 +6,7 @@
 | `src/graph.rs` | SSA IR, shape·dtype 추론 |
 | `src/autodiff.rs` | Reverse-mode VJP. 역전파를 같은 IR 노드로 생성 |
 | `src/optimize.rs` | 한 번의 순방향 재작성: 폴딩, 항등식, CSE, 브로드캐스트 제거, 전치 행렬곱 |
+| `src/egraph.rs` | Equality saturation: 규칙, shape 가드, 비용 모델, 추출 |
 | `src/plan.rs` | 스케줄링, 버퍼 할당, 커널, 원소 연산 그룹의 병렬 실행 |
 | `src/validate.rs` | 컴파일, 진단, 유한차분, 동치 검사, `run`, 재생, 프로파일 |
 | `src/metal.rs` | MSL 코드 생성, MPS 행렬곱, GPU 실행기, CPU 폴백 |

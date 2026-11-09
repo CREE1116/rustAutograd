@@ -5,7 +5,7 @@
 | 이름 | 설명 |
 | --- | --- |
 | `tensor(data, dtype=None)` | 숫자, 중첩 리스트, numpy 배열에서 `Tensor` 생성 |
-| `compile(fn, example_inputs, validate="standard", device="cpu")` | 추적, 미분, 최적화, 검증을 거쳐 `Compiled` 반환 |
+| `compile(fn, example_inputs, validate="standard", device="cpu", optimize="search-linear")` | 추적, 미분, 최적화, 검증을 거쳐 `Compiled` 반환. [`optimize` 모드](compiler.md#모드) |
 | `devices()` | 쓸 수 있는 디바이스 목록 |
 | `run(compiled, state, data=None, steps=1, callback=None, every=None)` | 네이티브 반복 실행, `RunResult` 반환 |
 | `inspect(target)` | `RunResult`나 `Compiled`의 분석 리포트. 실패 시 재생으로 원인 탐색 |

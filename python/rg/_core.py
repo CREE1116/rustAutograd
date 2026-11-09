@@ -841,8 +841,19 @@ def devices():
     return _rg.available_devices()
 
 
-def compile(fn, example_inputs, validate="standard", device="cpu"):
-    """Traces `fn(*example_inputs)`, differentiates, optimizes and tests it for `device`."""
+def compile(fn, example_inputs, validate="standard", device="cpu", optimize="search-linear"):
+    """Traces `fn(*example_inputs)`, differentiates, optimizes and tests it for `device`.
+
+    `optimize` chooses how hard to look for a better form of the same math:
+
+    - `"search-linear"` (default): also reorders and factors matrix products when that is cheaper.
+      This can change rounding, so `validate="standard"` or higher checks the result and falls
+      back to the plain plan if it disagrees.
+    - `"standard"`: only rewrites that keep the expression's structure.
+    - `"search-exact"`, `"search"`: narrower and wider rule sets.
+    - `"auto"`: times the candidates on the example inputs. Can differ between runs.
+    - `"none"`: only removes dead code.
+    """
     if not isinstance(example_inputs, tuple):
         example_inputs = (example_inputs,)
     leaves, in_def = _as_tensors(example_inputs)
@@ -857,7 +868,7 @@ def compile(fn, example_inputs, validate="standard", device="cpu"):
         out_ids = [_node(g, l, dtype) for l in out_leaves]
     finally:
         _traces.pop()
-    native = _rg.compile(g, out_ids, [t._t for t in leaves], validate, device)
+    native = _rg.compile(g, out_ids, [t._t for t in leaves], validate, device, optimize)
     compiled = Compiled(native, in_def, [(t.shape, t.dtype) for t in leaves], out_def, leaves)
     _warn_about_memory(compiled, src)
     return compiled

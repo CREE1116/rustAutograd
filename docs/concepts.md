@@ -47,7 +47,7 @@ assert float(rg.cond(rg.tensor(0.0), lambda v: v.log(), lambda v: v * v, rg.tens
 | --- | --- |
 | Trace | 함수를 실행해 SSA 그래프 생성, shape·dtype 즉시 검사 |
 | Autodiff | `grad` 호출마다 역전파 노드를 같은 그래프에 추가 |
-| Optimize | 상수 폴딩, 대수 단순화, CSE, DCE, 불필요한 브로드캐스트 제거, 전치 행렬곱 재작성 |
+| Optimize | 상수 폴딩, 대수 단순화, CSE, DCE, 불필요한 브로드캐스트 제거, 전치 행렬곱 재작성, 행렬곱 재결합, 중간값 재계산. [`optimize=`](compiler.md)로 조절 |
 | Plan | 생존 구간 분석으로 버퍼 재사용, in-place 실행, 큰 원소 연산 묶음의 병렬 실행 계획 |
 | Validate | 선택한 수준의 검증 수행, 리포트 작성 |
 

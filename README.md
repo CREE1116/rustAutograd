@@ -61,6 +61,8 @@ opt = optim.adamw(1e-3)
 
 **쓰지 않는 관찰은 비용이 없습니다.** `run`에는 계측 코드가 컴파일되어 들어가지 않습니다. 학습이 터지면 `rg.inspect`가 실행을 재생해 첫 실패 스텝과 원인 노드를 찾고, 재현 입력을 돌려줍니다.
 
+**같은 수학의 더 나은 표현을 컴파일러가 찾습니다.** 동치인 수식을 함께 유지하는 e-graph로 행렬곱 순서와 공통 인수를 고릅니다. `A @ B @ C @ D`를 비싼 순서로 써도 CPU에서 7.8배, `x @ (U @ V) @ x`는 14배 가까이 빨라집니다(M4 Pro, 해당 프로그램 기준). 이미 잘 쓴 코드는 그대로 둡니다. 재작성은 동치 검사를 통과해야 채택합니다. 무엇이 통했고 무엇이 안 통했는지는 [컴파일러 연구 기록](docs/compiler.md)에 있습니다.
+
 ## 오류는 문장이 아니라 증거입니다
 
 `where(x > 0, sqrt(x), 0)`은 값은 멀쩡한데 x=0에서 gradient가 NaN이 되는 유명한 함정입니다.
@@ -128,8 +130,8 @@ Apple M4 Pro에서 측정한 GPT 학습 스텝 속도입니다(steps/s, 높을�
 
 | 설정 | rg metal | MLX | torch MPS | rg cpu | torch CPU | JAX CPU |
 | --- | --- | --- | --- | --- | --- | --- |
-| d=128, 4층 | 85.6 | 88.4 | 65.5 | 31.5 | 32.5 | 41.3 |
-| d=256, 6층 | 13.8 | 12.5 | 12.8 | 5.9 | 6.9 | 5.4 |
+| d=128, 4층 | 86.6 | 87.4 | 65.2 | 31.1 | 31.1 | 41.3 |
+| d=256, 6층 | 13.7 | 12.4 | 12.8 | 5.8 | 6.7 | 5.4 |
 
 M4 Pro 한 대, GPT와 MLP 벤치마크뿐이므로 다른 모델이나 NVIDIA 환경으로 일반화할 수 없습니다. 조건과 재현 방법, 측정하며 틀렸던 가정들은 [성능](docs/performance.md)에 있습니다.
 
@@ -149,7 +151,7 @@ M4 Pro 한 대, GPT와 MLP 벤치마크뿐이므로 다른 모델이나 NVIDIA �
 
 ## 문서
 
-[설치](docs/install.md) · [빠른 시작](docs/quickstart.md) · [추적과 컴파일](docs/concepts.md) · [진단 시스템](docs/diagnostics.md) · [언어 모델 튜토리얼](docs/tutorial-gpt.md) · [API](docs/api.md) · [내부 구조](docs/internals.md)
+[설치](docs/install.md) · [빠른 시작](docs/quickstart.md) · [추적과 컴파일](docs/concepts.md) · [진단 시스템](docs/diagnostics.md) · [언어 모델 튜토리얼](docs/tutorial-gpt.md) · [API](docs/api.md) · [컴파일러 연구 기록](docs/compiler.md) · [내부 구조](docs/internals.md)
 
 문서 안의 Python 코드는 테스트에서 모두 실행됩니다. 사이트로 보려면 `mkdocs-material`을 설치하고 `mkdocs serve`를 실행하세요.
 

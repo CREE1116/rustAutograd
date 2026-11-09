@@ -1,5 +1,5 @@
 use crate::graph::{diag, Diag, Graph, Op};
-use crate::optimize::{optimize, OptStats};
+use crate::optimize::OptStats;
 use crate::metal::MetalProgram;
 use crate::plan::{CpuExec, Exec, Fuse, Instr, Observer, Plan};
 use crate::tensor::{Buf, DType, Elem, Tensor};
@@ -240,6 +240,9 @@ pub struct Compiled {
     pub gpu: Option<MetalProgram>,
     /// Finished CPU frames: first-touching a large frame's pages costs many steps' worth of time.
     frames: std::sync::Mutex<Vec<crate::plan::Frame>>,
+    /// The optimization mode, which the equivalence check must reproduce.
+    mode: crate::optimize::Mode,
+    pub opt_stats: OptStats,
 }
 
 #[derive(Clone, Debug)]
@@ -384,7 +387,84 @@ pub fn compile(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Level)
 }
 
 pub fn compile_on(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Level, use_metal: bool) -> Result<Compiled, Diag> {
-    let (opt, opt_out, opt_stats) = crate::optimize::optimize_for(&raw, &outputs, use_metal);
+    compile_mode(raw, outputs, examples, level, use_metal, crate::optimize::Mode::Standard)
+}
+
+pub fn compile_mode(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Level, use_metal: bool, mode: crate::optimize::Mode) -> Result<Compiled, Diag> {
+    use crate::optimize::Mode;
+    if mode == Mode::Auto {
+        return compile_auto(raw, outputs, examples, level, use_metal);
+    }
+    let mut c = build(raw.clone(), outputs.clone(), examples, level, use_metal, mode)?;
+    // Verify, then adopt: a rewrite that fails the equivalence check is discarded, not reported as
+    // a failure of the user's program.
+    let rewritten = c.opt_stats.search.as_ref().is_some_and(|s| s.0);
+    if rewritten && has_equivalence_failure(&c.report) {
+        let rejected = c.report["diagnostics"].as_array().and_then(|d| d.iter().find(|x| x["code"] == "OPTIMIZER_MISMATCH")).cloned();
+        c = build(raw, outputs, examples, level, use_metal, Mode::Standard)?;
+        if let Some(d) = rejected {
+            let note = diag("REWRITE_REJECTED", "warning", d["node"].clone(), d["observation"].clone(), "rewritten_program_failed_the_equivalence_check_standard_plan_used", "verified");
+            push_diagnostic(&mut c.report, note);
+        }
+    }
+    Ok(c)
+}
+
+fn has_equivalence_failure(report: &Value) -> bool {
+    report["diagnostics"].as_array().is_some_and(|d| d.iter().any(|x| x["code"] == "OPTIMIZER_MISMATCH"))
+}
+
+fn push_diagnostic(report: &mut Value, d: Diag) {
+    if let Some(list) = report["diagnostics"].as_array_mut() {
+        list.push(d);
+    }
+    if report["status"] == "ok" {
+        report["status"] = json!("warning");
+    }
+}
+
+/// Runs of each candidate, keeping the fastest time. A long-running step spends the budget at once.
+const AUTO_TIMING_RUNS: usize = 5;
+const AUTO_MIN_SPEEDUP: f64 = 1.05;
+
+fn timed(c: &Compiled, examples: &[Tensor]) -> f64 {
+    let mut best = f64::INFINITY;
+    let started = std::time::Instant::now();
+    for _ in 0..AUTO_TIMING_RUNS {
+        let t0 = std::time::Instant::now();
+        let _ = c.try_call(examples);
+        best = best.min(t0.elapsed().as_secs_f64());
+        if started.elapsed().as_secs_f64() > 0.25 {
+            break;
+        }
+    }
+    best
+}
+
+/// Lets the hardware decide between the plain plan and the rewritten one.
+fn compile_auto(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Level, use_metal: bool) -> Result<Compiled, Diag> {
+    use crate::optimize::Mode;
+    let standard = build(raw.clone(), outputs.clone(), examples, Level::None, use_metal, Mode::Standard)?;
+    let searched = compile_mode(raw.clone(), outputs.clone(), examples, Level::Basic, use_metal, Mode::SearchLinear)?;
+    let rewritten = searched.opt_stats.search.as_ref().is_some_and(|s| s.0);
+    let (mut use_search, mut timing) = (false, Value::Null);
+    if rewritten {
+        // The first call of each pays for allocation; only the later runs count.
+        let _ = (standard.try_call(examples), searched.try_call(examples));
+        let (a, b) = (timed(&standard, examples), timed(&searched, examples));
+        use_search = a / b >= AUTO_MIN_SPEEDUP;
+        timing = json!({ "standard_seconds": a, "rewritten_seconds": b });
+    }
+    drop(standard);
+    drop(searched);
+    let chosen = if use_search { Mode::SearchLinear } else { Mode::Standard };
+    let mut c = compile_mode(raw, outputs, examples, level, use_metal, chosen)?;
+    c.report["auto"] = json!({ "chosen": if use_search { "search-linear" } else { "standard" }, "rewrite_proposed": rewritten, "timing": timing });
+    Ok(c)
+}
+
+fn build(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Level, use_metal: bool, mode: crate::optimize::Mode) -> Result<Compiled, Diag> {
+    let (opt, opt_out, opt_stats) = crate::optimize::optimize_mode(&raw, &outputs, use_metal, mode);
     let plan = Plan::build_fused(&opt, &opt_out, if use_metal { Fuse::METAL } else { Fuse::DEFAULT });
     let gpu = if use_metal {
         Some(MetalProgram::new(&plan).map_err(|e| diag("DEVICE_UNAVAILABLE", "error", Value::Null, json!({ "device": "metal", "detail": e }), "metal_device_buffer_limit_or_kernel_compilation_failed", "verified"))?)
@@ -394,9 +474,10 @@ pub fn compile_on(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Lev
     let mut all = outputs.clone();
     all.extend(raw.grads.iter().map(|r| r.grad));
     let raw_plan = Plan::build(&raw, &all, false);
-    let mut c = Compiled { raw, outputs, plan, raw_plan, report: Value::Null, level, gpu, frames: Default::default() };
+    let mut c = Compiled { raw, outputs, plan, raw_plan, report: Value::Null, level, gpu, frames: Default::default(), mode, opt_stats };
     c.check_inputs(examples)?;
-    c.report = c.validate(examples, &opt_stats);
+    let stats = c.opt_stats.clone();
+    c.report = c.validate(examples, &stats);
     Ok(c)
 }
 
@@ -545,7 +626,7 @@ impl Compiled {
     fn optimizer_check(&self, examples: &[Tensor]) -> Result<Value, Diag> {
         let shadow = self.raw.to_f64();
         let inputs: Vec<Tensor> = examples.iter().map(as_f64).collect();
-        let (opt, ids, _) = optimize(&shadow, &self.outputs);
+        let (opt, ids, _) = crate::optimize::optimize_mode(&shadow, &self.outputs, false, self.mode);
         let run = |plan: &Plan| {
             let mut f = plan.frame();
             for (k, t) in inputs.iter().enumerate() {
@@ -580,7 +661,7 @@ impl Compiled {
     /// Compares GPU and CPU results in the program's own dtype. Float rounding differs between
     /// them and normalizations amplify it, so a disagreement is evidence and not a verdict.
     fn device_check(&self, examples: &[Tensor]) -> (Value, Vec<Diag>) {
-        let (opt, ids, _) = optimize(&self.raw, &self.outputs);
+        let (opt, ids, _) = crate::optimize::optimize_mode(&self.raw, &self.outputs, false, self.mode);
         let cpu_plan = Plan::build_fused(&opt, &ids, Fuse::DEFAULT);
         let mut f = cpu_plan.frame();
         for (k, t) in examples.iter().enumerate() {

@@ -1353,3 +1353,205 @@ fn cumsum_and_its_gradient() {
     assert_eq!(vals(&out[1]), [6., 5., 3., 15., 11., 6.]);
     assert_eq!(vals(&out[2]), [111., 110., 100., 222., 220., 200.]);
 }
+
+// Equality saturation.
+
+fn chain_graph(sizes: &[usize]) -> (Graph, u32, Vec<Tensor>) {
+    let mut g = Graph::new();
+    let mut inputs = vec![];
+    let mut ids = vec![];
+    for w in sizes.windows(2) {
+        ids.push(g.input(&[w[0], w[1]], F));
+        let n = w[0] * w[1];
+        inputs.push(t(&[w[0], w[1]], &(0..n).map(|i| ((i as f64) * 0.31).sin()).collect::<Vec<_>>()));
+    }
+    let mut v = ids[0];
+    for &m in &ids[1..] {
+        v = bin(&mut g, Op::MatMul, v, m);
+    }
+    (g, v, inputs)
+}
+
+/// The classic dynamic program, as the reference for what extraction should reach.
+fn optimal_chain_flops(d: &[usize]) -> f64 {
+    let n = d.len() - 1;
+    let mut m = vec![vec![0.0f64; n]; n];
+    for len in 2..=n {
+        for i in 0..=n - len {
+            let j = i + len - 1;
+            m[i][j] = (i..j).map(|k| m[i][k] + m[k + 1][j] + (d[i] * d[k + 1] * d[j + 1]) as f64).fold(f64::INFINITY, f64::min);
+        }
+    }
+    m[0][n - 1]
+}
+
+fn matmul_flops(g: &Graph, out: u32) -> f64 {
+    let keep = g.reachable(&[out]);
+    g.nodes.iter().enumerate().filter(|(i, n)| keep[*i] && matches!(n.op, Op::MatMul)).map(|(_, n)| (g.shape(n.inputs[0]).iter().product::<usize>() * g.shape(n.inputs[1])[1]) as f64).sum()
+}
+
+#[test]
+fn saturation_finds_the_optimal_matrix_chain_order() {
+    use rg::egraph::*;
+    for sizes in [vec![30, 35, 15, 5, 10, 20, 25], vec![1024, 8, 1024, 8, 1024], vec![4, 300, 2, 500, 3, 200, 6], vec![10, 20, 30, 40, 30]] {
+        let (g, out, inputs) = chain_graph(&sizes);
+        let (found, stats) = search(&g, &[out], CostModel::CPU, RuleSet::Rounding, &Limits { iterations: 12, nodes: 50_000 });
+        let (h, ids) = found.unwrap_or((g.clone(), vec![out]));
+        let got = matmul_flops(&h, ids[0]);
+        let best = optimal_chain_flops(&sizes);
+        // The model also charges for memory traffic, so it may trade a few multiplications away.
+        assert!(got <= best * 1.01, "{sizes:?}: {got} multiplications, optimal is {best}; {stats:?}");
+        let args: Vec<&Tensor> = inputs.iter().collect();
+        let (a, b) = (vals(&eval(&h, &ids, &args)[0]), vals(&eval(&g, &[out], &args)[0]));
+        let scale = b.iter().fold(1.0f64, |m, x| m.max(x.abs()));
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() <= 1e-9 * scale, "{x} vs {y}");
+        }
+    }
+}
+
+#[test]
+fn saturation_factors_common_terms_and_rejects_shape_changes() {
+    use rg::egraph::*;
+    let mut g = Graph::new();
+    let (a, b, c) = (g.input(&[64, 64], F), g.input(&[64, 64], F), g.input(&[64, 64], F));
+    let (ab, ac) = (bin(&mut g, Op::MatMul, a, b), bin(&mut g, Op::MatMul, a, c));
+    let s = bin(&mut g, Op::Add, ab, ac);
+    let (found, _) = search(&g, &[s], CostModel::CPU, RuleSet::Rounding, &DEFAULT_LIMITS);
+    let (h, ids) = found.expect("factoring is cheaper");
+    assert_eq!(h.nodes.iter().filter(|n| matches!(n.op, Op::MatMul)).count(), 1);
+    let v = |n: usize| t(&[64, 64], &(0..4096).map(|i| ((i * n) as f64 * 0.01).sin()).collect::<Vec<_>>());
+    let (x, y, z) = (v(1), v(2), v(3));
+    let (p, q) = (vals(&eval(&h, &ids, &[&x, &y, &z])[0]), vals(&eval(&g, &[s], &[&x, &y, &z])[0]));
+    for (u, w) in p.iter().zip(&q) {
+        assert!((u - w).abs() < 1e-9, "{u} vs {w}");
+    }
+    // a * (b + c) with broadcasting: factoring [3] and [1,3] operands must not change the shape.
+    let mut g = Graph::new();
+    let (a, b, c) = (g.input(&[3], F), g.input(&[3], F), g.input(&[2, 3], F));
+    let (ab, ac) = (bin(&mut g, Op::Mul, a, b), bin(&mut g, Op::Mul, a, c));
+    let s = bin(&mut g, Op::Add, ab, ac);
+    let (found, _) = search(&g, &[s], CostModel::CPU, RuleSet::Rounding, &DEFAULT_LIMITS);
+    let (h, ids) = found.unwrap_or((g.clone(), vec![s]));
+    assert_eq!(h.shape(ids[0]), [2, 3]);
+}
+
+#[test]
+fn exact_rules_never_change_a_bit_on_special_values() {
+    use rg::egraph::*;
+    let specials = [0.0, -0.0, 1.0, -1.5, 1e300, -1e300, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e-300];
+    let n = specials.len();
+    let a: Vec<f64> = specials.iter().flat_map(|&x| std::iter::repeat_n(x, n)).collect();
+    let b: Vec<f64> = (0..n).flat_map(|_| specials.iter().copied()).collect();
+    let (ta, tb) = (t(&[n * n], &a), t(&[n * n], &b));
+    let mut g = Graph::new();
+    let (x, y) = (g.input(&[n * n], F), g.input(&[n * n], F));
+    let nx = un(&mut g, Op::Neg, x);
+    let nn = un(&mut g, Op::Neg, nx);
+    let s1 = bin(&mut g, Op::Sub, nn, y);
+    let nm = bin(&mut g, Op::Mul, nx, y);
+    let d = bin(&mut g, Op::Div, nx, y);
+    let c = bin(&mut g, Op::Add, y, x);
+    let outs = [s1, nm, d, c];
+    let (found, stats) = search(&g, &outs, CostModel::CPU, RuleSet::Exact, &DEFAULT_LIMITS);
+    let (h, ids) = found.unwrap_or_else(|| panic!("search returned no form: {stats:?}"));
+    let (want, got) = (eval(&g, &outs, &[&ta, &tb]), eval(&h, &ids, &[&ta, &tb]));
+    for k in 0..outs.len() {
+        for (j, (u, v)) in vals(&want[k]).iter().zip(&vals(&got[k])).enumerate() {
+            assert!(u == v || (u.is_nan() && v.is_nan()), "output {k}[{j}]: {u} vs {v}");
+        }
+    }
+}
+
+#[test]
+fn searched_random_graphs_agree_with_reference_and_are_deterministic() {
+    use rg::optimize::{optimize_mode, Mode};
+    let mut r = Rng(0xC0FF_EE00_1234_5678);
+    let mut accepted = 0;
+    for case in 0..150 {
+        let mut g = Graph::new();
+        let (a, b) = (1 + r.below(4), 1 + r.below(4));
+        let shapes = [vec![], vec![b], vec![a, b], vec![b, a], vec![a, 1]];
+        let mut inputs = vec![];
+        let mut pool: Vec<u32> = vec![];
+        for s in [vec![a, b], vec![b, a], shapes[r.below(5)].clone()] {
+            let n: usize = s.iter().product();
+            pool.push(g.input(&s, F));
+            inputs.push(t(&s, &(0..n).map(|_| 0.5 + r.unit()).collect::<Vec<_>>()));
+        }
+        for _ in 0..3 + r.below(18) {
+            let x = pool[pool.len() - 1 - r.below(pool.len().min(4))];
+            let y = pool[r.below(pool.len())];
+            let res = match r.below(9) {
+                0 | 1 => g.add(Op::Add, &[x, y]),
+                2 => g.add(Op::Sub, &[x, y]),
+                3 | 4 => g.add(Op::Mul, &[x, y]),
+                5 => g.add(Op::Div, &[x, y]),
+                6 | 7 => g.add(Op::MatMul, &[x, y]),
+                _ => g.add(Op::Tanh, &[x]),
+            };
+            if let Ok(id) = res {
+                pool.push(id);
+            }
+        }
+        let last = *pool.last().unwrap();
+        let y = sum_all(&mut g, last);
+        let mut outs: Vec<u32> = (0..2).map(|_| pool[r.below(pool.len())]).collect();
+        outs.extend(grad(&mut g, y, &[pool[0]]).unwrap());
+        let args: Vec<&Tensor> = inputs.iter().collect();
+        let want = eval(&g, &outs, &args);
+        let (o, ids, st) = optimize_mode(&g, &outs, false, Mode::Search);
+        accepted += st.search.as_ref().unwrap().0 as usize;
+        let got = eval(&o, &ids, &args);
+        let (o2, ids2, _) = optimize_mode(&g, &outs, false, Mode::Search);
+        assert_eq!(format!("{:?}", eval(&o2, &ids2, &args)), format!("{got:?}"), "case {case}: the search must be deterministic"); // Debug form: NaN != NaN
+        for k in 0..outs.len() {
+            assert_eq!(want[k].shape, got[k].shape, "case {case} output {k}");
+            let w = vals(&want[k]);
+            let scale = w.iter().filter(|v| v.is_finite()).fold(1.0f64, |m, v| m.max(v.abs()));
+            for (j, (u, v)) in w.iter().zip(&vals(&got[k])).enumerate() {
+                let close = u == v || (u.is_nan() && v.is_nan()) || (u - v).abs() <= 1e-6 * scale || u.is_infinite() || v.is_infinite();
+                assert!(close, "case {case} output {k}[{j}]: {u} vs {v}");
+            }
+        }
+    }
+    assert!(accepted >= 5, "fuzz must exercise accepted rewrites: {accepted}");
+}
+
+#[test]
+fn a_rewrite_that_fails_the_equivalence_check_is_discarded_not_blamed_on_the_user() {
+    use rg::optimize::Mode;
+    // (A @ B) @ C with hugely mismatched scales: reassociation is valid mathematics but
+    // a rounding-sensitive sum cancels differently, far beyond the f64 tolerance.
+    let (n, big) = (64, 1e150);
+    let d: Vec<f64> = (0..n * n).map(|i| if i % (n + 1) == 0 { big } else { 0.0 }).collect();
+    let e: Vec<f64> = (0..n * n).map(|i| if i % (n + 1) == 0 { 1.0 / big } else { 0.0 }).collect();
+    let u: Vec<f64> = (0..n * n).map(|i| ((i * 7) as f64).sin()).collect();
+    let inputs = [t(&[n, n], &d), t(&[n, n], &d), t(&[n, n], &e), t(&[n, n], &e), t(&[n, n], &u)];
+    let mut g = Graph::new();
+    let ids: Vec<u32> = (0..5).map(|_| g.input(&[n, n], F)).collect();
+    let ab = bin(&mut g, Op::MatMul, ids[0], ids[1]);
+    let abc = bin(&mut g, Op::MatMul, ab, ids[2]);
+    let abcd = bin(&mut g, Op::MatMul, abc, ids[3]);
+    let o = bin(&mut g, Op::MatMul, abcd, ids[4]);
+    let c = rg::validate::compile_mode(g, vec![o], &inputs, Level::Standard, false, Mode::SearchLinear).unwrap();
+    // Whichever the model chose, nothing is reported as a failure of the program.
+    assert_ne!(c.report["status"], "validation_failed", "{}", c.report);
+    let codes: Vec<&str> = c.report["diagnostics"].as_array().unwrap().iter().map(|d| d["code"].as_str().unwrap()).collect();
+    assert!(!codes.contains(&"OPTIMIZER_MISMATCH"), "{codes:?}");
+}
+
+#[test]
+fn auto_mode_reports_its_choice_and_stays_correct() {
+    use rg::optimize::Mode;
+    let (g, out, inputs) = chain_graph(&[512, 8, 512, 8, 512]);
+    let c = rg::validate::compile_mode(g.clone(), vec![out], &inputs, Level::Standard, false, Mode::Auto).unwrap();
+    assert_eq!(c.report["auto"]["rewrite_proposed"], true);
+    assert_eq!(c.report["auto"]["chosen"], "search-linear", "{}", c.report["auto"]);
+    let want = eval(&g, &[out], &inputs.iter().collect::<Vec<_>>());
+    let got = c.call(&inputs);
+    let scale = vals(&want[0]).iter().fold(1.0f64, |m, x| m.max(x.abs()));
+    for (x, y) in vals(&got[0]).iter().zip(&vals(&want[0])) {
+        assert!((x - y).abs() <= 1e-9 * scale);
+    }
+}

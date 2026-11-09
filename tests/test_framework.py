@@ -700,3 +700,40 @@ def test_control_flow_runs_on_metal():
     (va, ga), (vb, gb) = cpu(p, xs), gpu(p, xs)
     assert float(va) == pytest.approx(float(vb), rel=1e-4)
     np.testing.assert_allclose(ga["w"].numpy(), gb["w"].numpy(), rtol=1e-3, atol=1e-5)
+
+
+def test_compile_reorders_matrix_products_by_default_and_can_be_told_not_to():
+    r = np.random.default_rng(10)
+    a, b, c, x = r.normal(size=(256, 4)), r.normal(size=(4, 256)), r.normal(size=(256, 4)), r.normal(size=(4,))
+
+    def f(a, b, c, x):
+        return ((a @ b @ c) @ x).sum()
+
+    inputs = (a, b, c, x)
+    default = rg.compile(f, inputs, validate="thorough")
+    plain = rg.compile(f, inputs, validate="thorough", optimize="standard")
+    search = default.report["graph"]["optimization"]["search"]
+    assert search["accepted"] and search["cost_after"] < search["cost_before"] * 0.5
+    assert plain.report["graph"]["optimization"]["search"] is None
+    assert default.report["status"] == "ok", default.report
+    assert float(default(*inputs)) == pytest.approx(float(plain(*inputs)), rel=1e-11)
+    assert float(rg.compile(f, inputs, optimize="auto")(*inputs)) == pytest.approx(float(plain(*inputs)), rel=1e-11)
+    with pytest.raises(ValueError):
+        rg.compile(f, inputs, optimize="magic")
+
+    # Gradients through the rewritten program match the plain one.
+    fn = rg.grad(f, argnums=(0, 3))
+    ga, gx = rg.compile(fn, inputs)(*inputs)
+    pa, px = rg.compile(fn, inputs, optimize="standard")(*inputs)
+    np.testing.assert_allclose(ga.numpy(), pa.numpy(), rtol=1e-10, atol=1e-11)
+    np.testing.assert_allclose(gx.numpy(), px.numpy(), rtol=1e-10, atol=1e-11)
+
+
+def test_programs_without_matrix_chains_compile_to_the_same_plan():
+    model, params = tiny_gpt("float32")
+    x = rg.tensor(np.random.default_rng(6).integers(0, 11, size=(2, 6)).astype("int32"))
+    fn = rg.grad(lambda p, x: nn.cross_entropy(model(p, x), x))
+    a, b = rg.compile(fn, (params, x)), rg.compile(fn, (params, x), optimize="standard")
+    assert a.report["graph"]["steps"] == b.report["graph"]["steps"]
+    for u, v in zip(rg.tree.leaves(a(params, x)), rg.tree.leaves(b(params, x))):
+        assert u.numpy().tobytes() == v.numpy().tobytes()

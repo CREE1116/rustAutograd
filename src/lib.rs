@@ -1,4 +1,5 @@
 pub mod autodiff;
+pub mod egraph;
 pub mod graph;
 #[cfg(target_os = "macos")]
 pub mod metal;

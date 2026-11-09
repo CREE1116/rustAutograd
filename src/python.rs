@@ -261,7 +261,8 @@ impl PyCompiled {
 }
 
 #[pyfunction]
-fn compile(py: Python<'_>, graph: &PyGraph, outputs: Vec<u32>, examples: Vec<PyTensor>, level: &str, device: &str) -> PyResult<PyCompiled> {
+fn compile(py: Python<'_>, graph: &PyGraph, outputs: Vec<u32>, examples: Vec<PyTensor>, level: &str, device: &str, optimize: &str) -> PyResult<PyCompiled> {
+    let mode = crate::optimize::Mode::parse(optimize).ok_or_else(|| PyValueError::new_err(format!("unknown optimize mode {optimize}")))?;
     let use_metal = match device {
         "cpu" => false,
         "metal" => true,
@@ -273,7 +274,7 @@ fn compile(py: Python<'_>, graph: &PyGraph, outputs: Vec<u32>, examples: Vec<PyT
     let level = Level::parse(level).ok_or_else(|| PyValueError::new_err(format!("unknown validation level {level}")))?;
     let examples = tensors(examples);
     let raw = graph.g.clone();
-    let c = py.detach(|| validate::compile_on(raw, outputs, &examples, level, use_metal)).map_err(|d| raise(py, d))?;
+    let c = py.detach(|| validate::compile_mode(raw, outputs, &examples, level, use_metal, mode)).map_err(|d| raise(py, d))?;
     Ok(PyCompiled { c })
 }
 

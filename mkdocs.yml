@@ -35,5 +35,6 @@ nav:
   - API 레퍼런스: api.md
   - 프로젝트:
       - 성능: performance.md
+      - 컴파일러 연구 기록: compiler.md
       - 범위와 비교: comparison.md
       - 내부 구조: internals.md

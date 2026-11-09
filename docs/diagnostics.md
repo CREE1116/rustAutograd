@@ -127,6 +127,7 @@ assert again["diagnostics"][0]["node"]["id"] == root["node"]["id"]
 | `NONFINITE_INPUT` | 입력이나 상수가 이미 비유한 | 입력 데이터 확인 |
 | `NONFINITE_OUTPUT` | 비유한 출력의 원인 분류 불가 (`unknown`) | 노드와 `observation` 확인 |
 | `INDEX_OUT_OF_RANGE` | `take`의 인덱스가 축 밖. 실행 시에는 경계로 고정됨 | 인덱스 수정 |
+| `REWRITE_REJECTED` | 수식 재작성이 동치 검사를 통과하지 못해 표준 계획을 사용함 (경고) | 조치 불필요. `observation`에 어긋난 값이 있음 |
 | `OPTIMIZER_MISMATCH` | 최적화된 계획과 원본 그래프의 결과가 다름 | 프레임워크 버그이므로 신고 |
 | `DEVICE_UNAVAILABLE` | 없는 디바이스 요청, Metal 장치 없음, 단일 버퍼가 장치 한계 초과, 생성 커널 컴파일 실패 | `rg.devices()` 확인 |
 | `DEVICE_EXECUTION_FAILED` | GPU가 명령 실패를 보고했거나 메모리를 할당하지 못함. `run`에서는 `observation.completed_steps`도 담음 | 메모리 확인, 모델 축소, CPU로 재현 |
