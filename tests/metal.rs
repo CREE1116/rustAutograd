@@ -22,7 +22,7 @@ fn ints(shape: &[usize], v: &[i32]) -> Tensor {
 fn on_gpu(g: &Graph, outs: &[u32], inputs: &[&Tensor]) -> Vec<Tensor> {
     let plan = Plan::build_fused(g, outs, Fuse::METAL);
     let prog = MetalProgram::new(&plan).expect("kernels must compile");
-    let mut e = prog.exec(&plan);
+    let mut e = prog.exec(&plan).unwrap();
     for (k, x) in inputs.iter().enumerate() {
         e.load(k, x);
     }
@@ -285,7 +285,7 @@ fn repeated_runs_do_not_leak_gpu_memory() {
     let prog = MetalProgram::new(&plan).unwrap();
     let input = seq(&[256, 256]);
     let cycle = || {
-        let mut e = prog.exec(&plan);
+        let mut e = prog.exec(&plan).unwrap();
         e.load(0, &input);
         for _ in 0..5 {
             e.step();
@@ -349,4 +349,42 @@ fn pooled_frames_keep_constants_and_do_not_leak_state_between_runs() {
         assert_eq!(prog.run(&spec, std::slice::from_ref(&input), &[], 3).state, first.state);
     }
     assert_eq!(first.state[0].data.to_f64(), [1.0, 8.0, 27.0, 64.0]);
+}
+
+#[test]
+fn a_buffer_beyond_the_device_limit_fails_at_compile_time_with_a_diagnostic() {
+    let huge = 1usize << 42; // 16 TiB of float32, and nothing is allocated
+    let mut g = Graph::new();
+    let x = g.input(&[huge], F);
+    let y = g.add(Op::Tanh, &[x]).unwrap();
+    let plan = Plan::build_fused(&g, &[y], Fuse::METAL);
+    let err = MetalProgram::new(&plan).err().expect("must refuse");
+    assert!(err.contains("exceeds"), "{err}");
+}
+
+#[test]
+fn gpu_failure_reaches_the_caller_as_a_diagnostic_and_stops_the_run() {
+    let mut g = Graph::new();
+    let w = g.input(&[4], F);
+    let two = g.scalar(F, 0.5);
+    let m = g.add(Op::Mul, &[w, two]).unwrap();
+    let input = t(&[4], &[1.0, 2.0, 3.0, 4.0]);
+    let c = compile_on(g, vec![m], std::slice::from_ref(&input), Level::Basic, true).unwrap();
+    let gpu = c.gpu.as_ref().unwrap();
+
+    gpu.inject_failure_for_test();
+    let d = c.try_call(std::slice::from_ref(&input)).unwrap_err();
+    assert_eq!(d["code"], "DEVICE_EXECUTION_FAILED");
+    assert_eq!(d["observation"]["detail"], "injected failure");
+
+    let spec = RunSpec { state: vec![(0, 0)], data: vec![], history: vec![] };
+    gpu.inject_failure_for_test();
+    let out = c.run(&spec, std::slice::from_ref(&input), &[], 10);
+    assert_eq!(out.steps, 0);
+    assert_eq!(out.device_error.as_deref(), Some("injected failure"));
+
+    // The program recovers: a later run on a recycled frame computes correctly.
+    let ok = c.run(&spec, std::slice::from_ref(&input), &[], 1);
+    assert!(ok.device_error.is_none());
+    assert_eq!(ok.state[0].data.to_f64(), [0.5, 1.0, 1.5, 2.0]);
 }

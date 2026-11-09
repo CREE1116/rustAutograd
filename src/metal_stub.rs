@@ -14,7 +14,7 @@ impl MetalProgram {
     pub fn new(_: &Plan) -> Result<MetalProgram, String> {
         Err("Metal exists only on Apple platforms".into())
     }
-    pub fn exec(&self, _: &Plan) -> MetalExec {
+    pub fn exec(&self, _: &Plan) -> Result<MetalExec, String> {
         unreachable!("MetalProgram cannot be constructed here")
     }
 }

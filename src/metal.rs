@@ -17,6 +17,8 @@ use objc2::AnyThread;
 use objc2_metal_performance_shaders::{MPSDataType, MPSMatrix, MPSMatrixDescriptor, MPSMatrixMultiplication};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -367,6 +369,7 @@ pub struct MetalProgram {
     /// Finished frames. Allocating one costs many steps' worth of time on a large model, and
     /// `run` needs one per chunk. Constants stay in place because swaps only touch other slots.
     pool: Mutex<Vec<Vec<Buffer>>>,
+    inject_failure: AtomicBool,
 }
 
 // SAFETY: Metal documents devices, queues and pipeline states as safe to share between threads.
@@ -386,6 +389,11 @@ impl MetalProgram {
 
     fn build(plan: &Plan) -> Result<MetalProgram, String> {
         let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        // Checked here so that an impossible plan fails at compile time and not mid-training.
+        let limit = device.maxBufferLength();
+        if let Some(&(d, n)) = plan.slots.iter().find(|&&(d, n)| n.saturating_mul(d.size()) > limit) {
+            return Err(format!("a {} buffer of {n} elements exceeds this device's limit of {limit} bytes", d.name()));
+        }
         let queue = device.newCommandQueue().ok_or("no command queue")?;
         let slot_dtype = |s: usize| plan.slots[s].0;
 
@@ -484,28 +492,33 @@ impl MetalProgram {
                 }
             }
         }
-        Ok(MetalProgram { device, queue, pipelines, steps: pending, encode_lock: Mutex::new(()), pool: Mutex::new(vec![]) })
+        Ok(MetalProgram { device, queue, pipelines, steps: pending, encode_lock: Mutex::new(()), pool: Mutex::new(vec![]), inject_failure: AtomicBool::new(false) })
     }
 
-    pub fn exec<'a>(&'a self, plan: &'a Plan) -> MetalExec<'a> {
-        if let Some(buffers) = self.pool.lock().expect("no panic while pooling").pop() {
-            return MetalExec { program: self, plan, buffers };
+    /// Fails when the GPU cannot provide the frame's memory.
+    pub fn exec<'a>(&'a self, plan: &'a Plan) -> Result<MetalExec<'a>, String> {
+        if let Some(buffers) = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Ok(MetalExec { program: self, plan, buffers, failure: RefCell::new(None) });
         }
-        let buffers: Vec<Buffer> = plan
-            .slots
-            .iter()
-            .map(|&(d, n)| {
-                let b = self.device.newBufferWithLength_options((n * d.size()).max(4), MTLResourceOptions::StorageModeShared).expect("buffer allocation failed");
-                // SAFETY: freshly created shared buffer of at least that many bytes, not yet in use.
-                unsafe { std::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0, (n * d.size()).max(4)) };
-                b
-            })
-            .collect();
-        let mut e = MetalExec { program: self, plan, buffers };
+        let mut buffers: Vec<Buffer> = Vec::with_capacity(plan.slots.len());
+        for &(d, n) in &plan.slots {
+            let bytes = (n * d.size()).max(4);
+            let b = self.device.newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared).ok_or_else(|| format!("could not allocate a GPU buffer of {bytes} bytes"))?;
+            // SAFETY: freshly created shared buffer of at least that many bytes, not yet in use.
+            unsafe { std::ptr::write_bytes(b.contents().as_ptr() as *mut u8, 0, bytes) };
+            buffers.push(b);
+        }
+        let mut e = MetalExec { program: self, plan, buffers, failure: RefCell::new(None) };
         for (s, t) in &plan.consts {
             e.write_prefix(*s, &t.data);
         }
-        e
+        Ok(e)
+    }
+
+    /// Makes the next encode fail as a GPU error would. Real failures cannot be provoked on demand.
+    #[doc(hidden)]
+    pub fn inject_failure_for_test(&self) {
+        self.inject_failure.store(true, Ordering::SeqCst);
     }
 }
 
@@ -513,6 +526,8 @@ pub struct MetalExec<'a> {
     program: &'a MetalProgram,
     plan: &'a Plan,
     buffers: Vec<Buffer>,
+    /// First GPU failure. Later steps do nothing, so the caller gets the original cause.
+    failure: RefCell<Option<String>>,
 }
 
 fn write_bytes(b: &Buffer, data: &Buf) {
@@ -542,7 +557,9 @@ fn read_bytes(b: &Buffer, d: DType, n: usize) -> Buf {
 
 impl Drop for MetalExec<'_> {
     fn drop(&mut self) {
-        self.program.pool.lock().expect("no panic while pooling").push(std::mem::take(&mut self.buffers));
+        // A failed command buffer may leave a frame half-written, but nothing reads a slot before
+        // writing it except inputs and constants, and encoders never write those.
+        self.program.pool.lock().unwrap_or_else(|e| e.into_inner()).push(std::mem::take(&mut self.buffers));
     }
 }
 
@@ -557,7 +574,14 @@ impl MetalExec<'_> {
         let t_start = std::time::Instant::now();
         let mut waited = 0.0;
         let mut cpu = 0.0;
-        let _guard = self.program.encode_lock.lock().expect("no panic while encoding");
+        if self.failure.borrow().is_some() {
+            return;
+        }
+        if self.program.inject_failure.swap(false, Ordering::SeqCst) {
+            *self.failure.borrow_mut() = Some("injected failure".to_string());
+            return;
+        }
+        let _guard = self.program.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         type Cb = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
         type Enc = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
         let mut cb: Option<Cb> = None;
@@ -567,6 +591,7 @@ impl MetalExec<'_> {
         let mut bound = [usize::MAX; BIND_CACHE];
         let mut gpu_seconds = 0.0;
         let mut command_buffers = 0;
+        let mut failure: Option<String> = None;
         let mut finish = |cb: &mut Option<Cb>, enc: &mut Option<Enc>, waited: &mut f64| {
             if let Some(e) = enc.take() {
                 e.endEncoding();
@@ -579,8 +604,7 @@ impl MetalExec<'_> {
                 gpu_seconds += c.GPUEndTime() - c.GPUStartTime();
                 command_buffers += 1;
                 if let Some(err) = c.error() {
-                    // shortcut: a GPU failure aborts the call as a panic, make it a Diag if it proves recoverable
-                    panic!("Metal command buffer failed: {}", err.localizedDescription());
+                    failure.get_or_insert_with(|| err.localizedDescription().to_string());
                 }
             }
         };
@@ -591,12 +615,12 @@ impl MetalExec<'_> {
                         continue;
                     }
                     // Unretained: `self.buffers` outlives the wait below, so per-binding retains are waste.
-                    let c = cb.get_or_insert_with(|| self.program.queue.commandBufferWithUnretainedReferences().expect("command buffer"));
+                    let c = cb.get_or_insert_with(|| self.program.queue.commandBufferWithUnretainedReferences().expect("Metal always provides a command buffer while the queue is alive"));
                     if enc.is_none() {
                         bound_pipeline = usize::MAX;
                         bound = [usize::MAX; BIND_CACHE];
                     }
-                    let e = enc.get_or_insert_with(|| c.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent).expect("compute encoder"));
+                    let e = enc.get_or_insert_with(|| c.computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent).expect("a fresh command buffer provides an encoder"));
                     if *barrier {
                         e.memoryBarrierWithScope(MTLBarrierScope::Buffers);
                         stats.barriers += 1;
@@ -622,7 +646,7 @@ impl MetalExec<'_> {
                         e.endEncoding();
                     }
                     stats.mps += 1;
-                    let c = cb.get_or_insert_with(|| self.program.queue.commandBufferWithUnretainedReferences().expect("command buffer"));
+                    let c = cb.get_or_insert_with(|| self.program.queue.commandBufferWithUnretainedReferences().expect("Metal always provides a command buffer while the queue is alive"));
                     // SAFETY: descriptors were derived from these slots' shapes. Matrix objects are
                     // built per encode because state buffers swap between steps.
                     unsafe {
@@ -644,6 +668,9 @@ impl MetalExec<'_> {
             }
         }
         finish(&mut cb, &mut enc, &mut waited);
+        if let Some(f) = failure {
+            *self.failure.borrow_mut() = Some(f);
+        }
         stats.wall += t_start.elapsed().as_secs_f64();
         stats.waited += waited;
         stats.cpu += cpu;
@@ -695,6 +722,9 @@ impl Exec for MetalExec<'_> {
     }
     fn step(&mut self) {
         self.encode(0..self.program.steps.len(), &mut Stats::default());
+    }
+    fn failure(&self) -> Option<String> {
+        self.failure.borrow().clone()
     }
     fn swap(&mut self, a: usize, b: usize) {
         self.buffers.swap(a, b);

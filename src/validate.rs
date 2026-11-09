@@ -230,6 +230,8 @@ pub struct RunOut {
     pub nonfinite_step: Option<usize>,
     /// Time in the step loop, excluding one-time buffer setup.
     pub seconds: f64,
+    /// Set when the device failed; `steps` then counts only the completed steps.
+    pub device_error: Option<String>,
 }
 
 fn read_scalar(b: &Buf) -> f64 {
@@ -286,6 +288,7 @@ fn run_loop<E: Exec>(p: &Plan, e: &mut E, spec: &RunSpec, state: &[Tensor], batc
     let mut outputs = vec![];
     let mut done = 0;
     let mut nonfinite_step = None;
+    let mut device_error = None;
 
     let started = std::time::Instant::now();
     for k in 0..steps {
@@ -293,6 +296,10 @@ fn run_loop<E: Exec>(p: &Plan, e: &mut E, spec: &RunSpec, state: &[Tensor], batc
             load_batch(e, &batches[k % batches.len()]);
         }
         e.step();
+        device_error = e.failure();
+        if device_error.is_some() {
+            break;
+        }
         done = k + 1;
         let mut bad = false;
         for (h, &s) in history.iter_mut().zip(&hist_slots) {
@@ -319,7 +326,11 @@ fn run_loop<E: Exec>(p: &Plan, e: &mut E, spec: &RunSpec, state: &[Tensor], batc
     }
     let seconds = started.elapsed().as_secs_f64();
     let final_state = spec.state.iter().map(|&(i, o)| Tensor { shape: p.outputs[o].shape.clone(), data: e.prefix(p.input_slots[i], p.input_ns[i]) }).collect();
-    RunOut { state: final_state, outputs, history, steps: done, nonfinite_step, seconds }
+    RunOut { state: final_state, outputs, history, steps: done, nonfinite_step, seconds, device_error }
+}
+
+pub fn device_failure(error: &str) -> Diag {
+    diag("DEVICE_EXECUTION_FAILED", "error", Value::Null, json!({ "device": "metal", "detail": error }), "gpu_reported_a_failure", "verified")
 }
 
 pub const VALIDATION_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -346,7 +357,7 @@ pub fn compile_on(raw: Graph, outputs: Vec<u32>, examples: &[Tensor], level: Lev
     let (opt, opt_out, opt_stats) = crate::optimize::optimize_for(&raw, &outputs, use_metal);
     let plan = Plan::build_fused(&opt, &opt_out, if use_metal { Fuse::METAL } else { Fuse::DEFAULT });
     let gpu = if use_metal {
-        Some(MetalProgram::new(&plan).map_err(|e| diag("DEVICE_UNAVAILABLE", "error", Value::Null, json!({ "device": "metal", "detail": e }), "metal_device_or_kernel_compilation_failed", "verified"))?)
+        Some(MetalProgram::new(&plan).map_err(|e| diag("DEVICE_UNAVAILABLE", "error", Value::Null, json!({ "device": "metal", "detail": e }), "metal_device_buffer_limit_or_kernel_compilation_failed", "verified"))?)
     } else {
         None
     };
@@ -380,22 +391,29 @@ impl Compiled {
         Ok(())
     }
 
-    /// One execution of the optimized plan.
-    pub fn call(&self, inputs: &[Tensor]) -> Vec<Tensor> {
+    /// One execution of the optimized plan. Only a device can fail; the CPU path always succeeds.
+    pub fn try_call(&self, inputs: &[Tensor]) -> Result<Vec<Tensor>, Diag> {
         if let Some(gpu) = &self.gpu {
-            let mut e = gpu.exec(&self.plan);
+            let mut e = gpu.exec(&self.plan).map_err(|error| device_failure(&error))?;
             for (k, t) in inputs.iter().enumerate() {
                 e.load(k, t);
             }
             e.step();
-            return self.plan.outputs.iter().map(|o| Tensor { shape: o.shape.clone(), data: e.prefix(o.slot, o.n) }).collect();
+            if let Some(error) = e.failure() {
+                return Err(device_failure(&error));
+            }
+            return Ok(self.plan.outputs.iter().map(|o| Tensor { shape: o.shape.clone(), data: e.prefix(o.slot, o.n) }).collect());
         }
         let mut f = self.plan.frame();
         for (k, t) in inputs.iter().enumerate() {
             self.plan.load_input(&mut f, k, t);
         }
         self.plan.exec(&mut f, &mut ());
-        (0..self.outputs.len()).map(|k| self.plan.read_output(&f, k)).collect()
+        Ok((0..self.outputs.len()).map(|k| self.plan.read_output(&f, k)).collect())
+    }
+
+    pub fn call(&self, inputs: &[Tensor]) -> Vec<Tensor> {
+        self.try_call(inputs).expect("use try_call where the device can fail")
     }
 
     /// Instrumented run of the unoptimized graph, so node ids and sources match the trace.
@@ -539,7 +557,10 @@ impl Compiled {
             cpu_plan.load_input(&mut f, k, t);
         }
         cpu_plan.exec(&mut f, &mut ());
-        let gpu = self.call(examples);
+        let gpu = match self.try_call(examples) {
+            Ok(values) => values,
+            Err(d) => return (json!({ "skipped": "device_failed" }), vec![d]),
+        };
         let mut max_rel = 0.0f64;
         let mut diags = vec![];
         for (k, g) in gpu.iter().enumerate() {
@@ -661,9 +682,16 @@ impl Compiled {
         let check_status = |d: &[Diag]| if d.is_empty() { "pass" } else if d.iter().any(|x| x["severity"] == "error") { "fail" } else { "warn" };
 
         if self.level >= Level::Basic {
-            let out = self.call(examples);
-            let shapes: Vec<_> = out.iter().map(|t| t.shape.clone()).collect();
-            checks.push(json!({ "name": "test_run", "status": "pass", "output_shapes": shapes }));
+            match self.try_call(examples) {
+                Ok(out) => {
+                    let shapes: Vec<_> = out.iter().map(|t| t.shape.clone()).collect();
+                    checks.push(json!({ "name": "test_run", "status": "pass", "output_shapes": shapes }));
+                }
+                Err(d) => {
+                    checks.push(json!({ "name": "test_run", "status": "fail" }));
+                    diagnostics.push(d);
+                }
+            }
         }
         if self.level >= Level::Standard {
             let found = self.check(examples);
@@ -730,7 +758,10 @@ impl Compiled {
         let repeats = repeats.max(1);
         let mut breakdown = None;
         if let Some(gpu) = &self.gpu {
-            let mut e = gpu.exec(p);
+            let mut e = match gpu.exec(p) {
+                Ok(e) => e,
+                Err(error) => return json!({ "error": device_failure(&error) }),
+            };
             for (k, t) in inputs.iter().enumerate() {
                 e.load(k, t);
             }
@@ -783,7 +814,10 @@ impl Compiled {
 
     pub fn run(&self, spec: &RunSpec, state: &[Tensor], batches: &[Vec<Tensor>], steps: usize) -> RunOut {
         match &self.gpu {
-            Some(gpu) => run_loop(&self.plan, &mut gpu.exec(&self.plan), spec, state, batches, steps),
+            Some(gpu) => match gpu.exec(&self.plan) {
+                Ok(mut e) => run_loop(&self.plan, &mut e, spec, state, batches, steps),
+                Err(error) => RunOut { state: state.to_vec(), outputs: vec![], history: vec![vec![]; spec.history.len()], steps: 0, nonfinite_step: None, seconds: 0.0, device_error: Some(error) },
+            },
             None => {
                 let frame = self.frames.lock().expect("no panic while pooling").pop().unwrap_or_else(|| self.plan.frame());
                 let mut e = CpuExec { plan: &self.plan, frame };
@@ -802,6 +836,9 @@ impl Compiled {
             let b = if batches.is_empty() { 0 } else { k % batches.len() };
             let slice = if batches.is_empty() { &[][..] } else { std::slice::from_ref(&batches[b]) };
             let out = self.run(spec, &cur, slice, 1);
+            if out.device_error.is_some() {
+                return None;
+            }
             if out.state.iter().chain(&out.outputs).any(|t| !t.is_finite()) {
                 return Some((k, b, cur));
             }

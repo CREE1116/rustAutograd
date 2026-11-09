@@ -199,7 +199,7 @@ impl PyCompiled {
     fn call(&self, py: Python<'_>, inputs: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
         let inputs = tensors(inputs);
         self.c.check_inputs(&inputs).map_err(|d| raise(py, d))?;
-        Ok(wrap(py.detach(|| self.c.call(&inputs))))
+        py.detach(|| self.c.try_call(&inputs)).map(wrap).map_err(|d| raise(py, d))
     }
     fn check(&self, py: Python<'_>, inputs: Vec<PyTensor>) -> PyResult<String> {
         let inputs = tensors(inputs);
@@ -219,6 +219,11 @@ impl PyCompiled {
         let state = tensors(state);
         let batches: Vec<Vec<Tensor>> = batches.into_iter().map(tensors).collect();
         let out = py.detach(|| self.c.run(&spec, &state, &batches, steps));
+        if let Some(error) = &out.device_error {
+            let mut d = validate::device_failure(error);
+            d["observation"]["completed_steps"] = serde_json::json!(out.steps);
+            return Err(raise(py, d));
+        }
         let seconds = out.seconds;
         Ok((wrap(out.state), wrap(out.outputs), out.history, out.steps, out.nonfinite_step, seconds))
     }

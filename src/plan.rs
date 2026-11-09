@@ -34,6 +34,10 @@ pub trait Exec {
     fn prefix(&self, slot: usize, n: usize) -> Buf;
     fn write_prefix(&mut self, slot: usize, b: &Buf);
     fn scalar(&self, slot: usize) -> f64;
+    /// Why the last step failed, on devices where execution can fail.
+    fn failure(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct CpuExec<'a> {

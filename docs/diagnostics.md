@@ -125,7 +125,8 @@ assert again["diagnostics"][0]["node"]["id"] == root["node"]["id"]
 | `NONFINITE_OUTPUT` | 비유한 출력의 원인 분류 불가 (`unknown`) | 노드와 `observation` 확인 |
 | `INDEX_OUT_OF_RANGE` | `take`의 인덱스가 축 밖. 실행 시에는 경계로 고정됨 | 인덱스 수정 |
 | `OPTIMIZER_MISMATCH` | 최적화된 계획과 원본 그래프의 결과가 다름 | 프레임워크 버그이므로 신고 |
-| `DEVICE_UNAVAILABLE` | 없는 디바이스 요청, Metal 장치 없음, 생성 커널 컴파일 실패 | `rg.devices()` 확인 |
+| `DEVICE_UNAVAILABLE` | 없는 디바이스 요청, Metal 장치 없음, 단일 버퍼가 장치 한계 초과, 생성 커널 컴파일 실패 | `rg.devices()` 확인 |
+| `DEVICE_EXECUTION_FAILED` | GPU가 명령 실패를 보고했거나 메모리를 할당하지 못함. `run`에서는 `observation.completed_steps`도 담음 | 메모리 확인, 모델 축소, CPU로 재현 |
 | `DEVICE_MISMATCH` | GPU 결과가 CPU와 다름 (경고, `suspected`) | 정규화가 반올림을 증폭해도 생길 수 있음. 값 차이 확인 |
 | `PLAN_NEAR_PHYSICAL_MEMORY` | 중간 버퍼 계획이 물리 메모리의 절반 초과 (경고, `suspected`). 스왑으로 몇 배 느려질 수 있음 | 배치나 모델 축소, `report["memory"]` 확인 |
 | `REPLAY_DID_NOT_REPRODUCE` | 재생에서 실패가 재현되지 않음 (`unknown`) | 입력의 결정성 확인 |
